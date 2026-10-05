@@ -4735,29 +4735,36 @@ static void ggml_compute_forward_out_prod_q_f32(
 
     float * wdata = (float *) params->wdata + (ne0 + CACHE_LINE_SIZE_F32) * ith;
 
-    for (int64_t ir = ir0; ir < ir1; ++ir) {
+    // the dst rows of this thread that share i2, i3 are processed together, so that every src0 row
+    // is dequantized once per group instead of once per dst row
+    for (int64_t ir = ir0; ir < ir1; ) {
         // dst indices
-        const int64_t i3 = ir/(ne2*ne1);
-        const int64_t i2 = (ir - i3*ne2*ne1)/ne1;
-        const int64_t i1 = (ir - i3*ne2*ne1 - i2*ne1);
+        const int64_t i3  = ir/(ne2*ne1);
+        const int64_t i2  = (ir - i3*ne2*ne1)/ne1;
+        const int64_t i1s = (ir - i3*ne2*ne1 - i2*ne1);
+        const int64_t i1e = MIN(ne1, i1s + (ir1 - ir));
 
         const int64_t i02 = i2;
         const int64_t i03 = i3;
 
-        //const int64_t i10 = i1;
         const int64_t i12 = i2;
         const int64_t i13 = i3;
 
         for (int64_t i01 = 0; i01 < ne01; ++i01) {
             const int64_t i11 = i01;
 
-            float * s0 = (float *) ((char *) src0->data + (          i01*nb01 + i02*nb02 + i03*nb03));
-            float * s1 = (float *) ((char *) src1->data + (i1*nb10 + i11*nb11 + i12*nb12 + i13*nb13));
-            float * d  = (float *) ((char *)  dst->data + (          i1*nb1 + i2*nb2 + i3*nb3));
-
+            const char * s0 = (const char *) src0->data + (i01*nb01 + i02*nb02 + i03*nb03);
             dequantize_row_q(s0, wdata, ne0);
-            ggml_vec_mad_f32(ne0, d, wdata, *s1);
+
+            for (int64_t i1 = i1s; i1 < i1e; ++i1) {
+                const float * s1 = (const float *) ((const char *) src1->data + (i1*nb10 + i11*nb11 + i12*nb12 + i13*nb13));
+                float       * d  = (float       *) ((      char *)  dst->data + (i1*nb1 + i2*nb2 + i3*nb3));
+
+                ggml_vec_mad_f32(ne0, d, wdata, *s1);
+            }
         }
+
+        ir += i1e - i1s;
     }
 }
 
