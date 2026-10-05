@@ -3807,6 +3807,27 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--classifier"}, "FNAME",
+        "GGUF classifier head (general.type = classifier) on the loaded model, served at POST /classify; can be repeated",
+        [](common_params & params, const std::string & value) {
+            params.classifier_heads.push_back(value);
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--classifier-ctx"}, "N",
+        string_format("maximum number of tokens of an input to POST /classify (default: %d)", params.classifier_n_ctx),
+        [](common_params & params, int value) {
+            params.classifier_n_ctx = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--lora-train"},
+        "enable POST /lora/train: train LoRA adapters on the loaded model between requests (default: disabled)",
+        [](common_params & params) {
+            params.lora_train = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--lora-init-without-apply"},
         string_format("load LoRA adapters without applying them (apply later via POST /lora-adapters) (default: %s)", params.lora_init_without_apply ? "enabled" : "disabled"),
         [](common_params & params) {

@@ -15,6 +15,10 @@ add_library(${TARGET} STATIC
     server-common.h
     server-decision.cpp
     server-decision.h
+    server-classifier.cpp
+    server-classifier.h
+    server-lora-train.cpp
+    server-lora-train.h
     server-context.cpp
     server-context.h
     server-stream.cpp

@@ -2,6 +2,8 @@
 #include "server-chat.h"
 #include "server-common.h"
 #include "server-decision.h"
+#include "server-classifier.h"
+#include "server-lora-train.h"
 #include "server-http.h"
 #include "server-task.h"
 #include "server-queue.h"
@@ -1036,7 +1038,14 @@ private:
 
     int64_t t_last_load_progress_ms = 0;
 
+    // classifier heads and LoRA training on the loaded model (--classifier, --lora-train)
+    std::unique_ptr<server_classifier> classifier;
+    std::unique_ptr<server_lora_train> lora_train;
+
     void destroy() {
+        classifier.reset();
+        lora_train.reset();
+
         spec.reset();
         spec_init.reset();
 
@@ -1205,6 +1214,12 @@ private:
             params_base.load_progress_callback_user_data = &load_progress_text;
         }
 
+        if (params_base.lora_train && !params_base.no_extra_bufts) {
+            // the backward pass reads the frozen weights through OUT_PROD, which repacked layouts do not support
+            SRV_INF("%s", "--lora-train: disabling weight repacking\n");
+            params_base.no_extra_bufts = true;
+        }
+
         llama_init = common_init_from_params(params_base);
 
         model_tgt = llama_init->model();
@@ -1221,6 +1236,20 @@ private:
         }
 
         vocab = llama_model_get_vocab(model_tgt);
+
+        if (!params_base.classifier_heads.empty()) {
+            try {
+                classifier = std::make_unique<server_classifier>();
+                classifier->init(model_tgt, params_base.classifier_heads, params_base.classifier_n_ctx, params_base.cpuparams_batch.n_threads);
+                SRV_INF("loaded %zu classifier head(s): %s\n", classifier->heads.size(), classifier->info().dump().c_str());
+            } catch (const std::exception & e) {
+                SRV_ERR("failed to load the classifier heads: %s\n", e.what());
+                return false;
+            }
+        }
+        if (params_base.lora_train) {
+            lora_train = std::make_unique<server_lora_train>();
+        }
 
         try {
             decision.init(model_tgt);
@@ -2927,6 +2956,61 @@ private:
                     res->id = task.id;
                     queue_results.send(std::move(res));
                 } break;
+            case SERVER_TASK_TYPE_CLASSIFY:
+                {
+                    if (!classifier) {
+                        send_error(task.id, "no classifier heads are loaded, start the server with --classifier", ERROR_TYPE_NOT_SUPPORTED);
+                        break;
+                    }
+                    try {
+                        auto res = std::make_unique<server_task_result_json>();
+                        res->id    = task.id;
+                        res->index = task.index;
+                        res->data  = json {
+                            {"model",   model_name},
+                            {"answers", classifier->classify(task.tokens_classify)},
+                            {"usage",   {{"input_tokens", task.tokens_classify.size()}, {"output_tokens", 0}}},
+                        };
+                        queue_results.send(std::move(res));
+                    } catch (const std::invalid_argument & e) {
+                        send_error(task.id, e.what(), ERROR_TYPE_INVALID_REQUEST);
+                    } catch (const std::exception & e) {
+                        send_error(task.id, e.what(), ERROR_TYPE_SERVER);
+                    }
+                } break;
+            case SERVER_TASK_TYPE_LORA_TRAIN:
+                {
+                    if (!lora_train) {
+                        send_error(task.id, "LoRA training is disabled, start the server with --lora-train", ERROR_TYPE_NOT_SUPPORTED);
+                        break;
+                    }
+                    try {
+                        const int id = lora_train->start(model_tgt, vocab, task.lora_train, params_base.cpuparams_batch.n_threads);
+                        auto res = std::make_unique<server_task_result_json>();
+                        res->id   = task.id;
+                        res->data = lora_train->status().back();
+                        queue_results.send(std::move(res));
+                        SRV_INF("LoRA training job %d queued\n", id);
+                        post_lora_train_step();
+                    } catch (const std::exception & e) {
+                        send_error(task.id, e.what(), ERROR_TYPE_INVALID_REQUEST);
+                    }
+                } break;
+            case SERVER_TASK_TYPE_LORA_TRAIN_STATUS:
+            case SERVER_TASK_TYPE_LORA_TRAIN_CANCEL:
+                {
+                    auto res = std::make_unique<server_task_result_json>();
+                    res->id = task.id;
+                    if (task.type == SERVER_TASK_TYPE_LORA_TRAIN_CANCEL) {
+                        const int id = json_value(task.lora_train, "id", -1);
+                        res->data = json {{"id", id}, {"cancelled", lora_train && lora_train->cancel(id)}};
+                    } else {
+                        res->data = lora_train ? lora_train->status() : json::array();
+                    }
+                    queue_results.send(std::move(res));
+                } break;
+            case SERVER_TASK_TYPE_LORA_TRAIN_STEP:
+                break; // the step itself runs in update_slots()
         }
 
         return true;
@@ -2995,7 +3079,51 @@ private:
     };
 #endif
 
+    // keep the server loop running while a LoRA training job is active
+    void post_lora_train_step() {
+        server_task task(SERVER_TASK_TYPE_LORA_TRAIN_STEP);
+        task.id = queue_tasks.get_new_id();
+        queue_tasks.post(std::move(task));
+    }
+
+    // one optimizer step of the active LoRA training job, between decode rounds
+    void lora_train_step() {
+        if (!lora_train || !lora_train->busy()) {
+            return;
+        }
+        if (!lora_train->shared()) {
+            bool any_processing = false;
+            for (const auto & slot : slots) {
+                any_processing |= slot.is_processing();
+            }
+            if (any_processing) {
+                post_lora_train_step(); // idle priority: wait until the requests are done
+                return;
+            }
+        }
+        llama_adapter_lora * adapter = lora_train->step();
+        if (adapter) {
+            // the job saved the adapter (to a temporary file if no path was given), so that it is
+            // reloaded with the model after sleeping; new requests can select it with scale > 0
+            const json job = lora_train->status().back();
+            common_adapter_lora_info info;
+            info.path      = job.at("path").get<std::string>();
+            info.scale     = 0.0f;
+            info.task_name = job.at("name").get<std::string>();
+            info.ptr       = adapter;
+            params_base.lora_adapters.push_back(info);
+            lora_train->set_adapter_id((int) params_base.lora_adapters.size() - 1);
+            SRV_INF("LoRA training job %d done: adapter id %zu, %s\n", job.at("id").get<int>(),
+                    params_base.lora_adapters.size() - 1, info.path.c_str());
+        }
+        if (lora_train->busy()) {
+            post_lora_train_step();
+        }
+    }
+
     void update_slots() {
+        lora_train_step();
+
 #ifdef DEBUG_TIMINGS
         static int64_t t_prev = 0;
         int64_t t_start = ggml_time_us();
@@ -5720,6 +5848,100 @@ void server_routes::init_routes() {
         GGML_ASSERT(dynamic_cast<server_task_result_apply_lora*>(result.get()) != nullptr);
         res->ok(result->to_json());
         return res;
+    };
+
+    // input: a string, a token array, or an array of those; one typed-decision object per input
+    this->post_classify = [this](const server_http_req & req) {
+        auto res = create_response();
+        const json body = json::parse(req.body);
+        json input;
+        if (body.contains("input")) {
+            input = body.at("input");
+        } else if (body.contains("content")) {
+            input = body.at("content");
+        } else {
+            res->error(format_error_response("\"input\" must be provided", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        const bool batched = input.is_array() && !json_is_array_and_contains_numbers(input);
+        std::vector<llama_tokens> items;
+        auto tokenize = [&](const json & p) -> llama_tokens {
+            if (p.is_string()) {
+                return common_tokenize(ctx_server.vocab, p.get<std::string>(), true, true);
+            }
+            return p.get<llama_tokens>();
+        };
+        if (batched) {
+            for (const auto & p : input) {
+                items.push_back(tokenize(p));
+            }
+        } else {
+            items.push_back(tokenize(input));
+        }
+        for (const auto & it : items) {
+            if (it.empty()) {
+                res->error(format_error_response("an input is empty", ERROR_TYPE_INVALID_REQUEST));
+                return res;
+            }
+        }
+
+        auto & rd = res->rd;
+        {
+            std::vector<server_task> tasks;
+            for (auto & it : items) {
+                server_task task(SERVER_TASK_TYPE_CLASSIFY);
+                task.id = rd.get_new_id();
+                task.tokens_classify = std::move(it);
+                tasks.push_back(std::move(task));
+            }
+            rd.post_tasks(std::move(tasks));
+        }
+        auto all_results = rd.wait_for_all(req.should_stop);
+        if (all_results.is_terminated) {
+            return res;
+        } else if (all_results.error) {
+            res->error(all_results.error->to_json());
+            return res;
+        }
+        json out = json::array();
+        for (auto & r : all_results.results) {
+            out.push_back(r->to_json());
+        }
+        res->ok(batched ? out : out.at(0));
+        return res;
+    };
+
+    auto lora_train_task = [this](const server_http_req & req, server_task_type type, const json & body) {
+        auto res = create_response();
+        auto & rd = res->rd;
+        {
+            server_task task(type);
+            task.id = rd.get_new_id();
+            task.lora_train = body;
+            rd.post_task(std::move(task));
+        }
+        auto result = rd.next(req.should_stop);
+        if (!result) {
+            GGML_ASSERT(req.should_stop());
+            return res;
+        }
+        if (result->is_error()) {
+            res->error(result->to_json());
+            return res;
+        }
+        res->ok(result->to_json());
+        return res;
+    };
+
+    // body: {"text" | "tokens", "rank", "alpha", "lr", "epochs", "n_ctx", "targets", "name", "path", "seed"}
+    this->post_lora_train = [lora_train_task](const server_http_req & req) {
+        return lora_train_task(req, SERVER_TASK_TYPE_LORA_TRAIN, json::parse(req.body));
+    };
+    this->get_lora_train = [lora_train_task](const server_http_req & req) {
+        return lora_train_task(req, SERVER_TASK_TYPE_LORA_TRAIN_STATUS, json::object());
+    };
+    this->post_lora_train_cancel = [lora_train_task](const server_http_req & req) {
+        return lora_train_task(req, SERVER_TASK_TYPE_LORA_TRAIN_CANCEL, json::parse(req.body));
     };
 }
 
