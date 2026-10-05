@@ -115,7 +115,9 @@ enum llama_decision_order {
 LLAMA_API bool llama_batch_ext_set_decision_order(struct llama_batch_ext * batch, int32_t idx, enum llama_decision_order order);
 
 // Early exit: n > 0 builds the trunk graph only up to n layers (then output_norm, pooling /
-// LM head as usual), e.g. for a classifier context sharing the model's weights. 0 = all layers.
+// LM head as usual), e.g. for a classifier context sharing the model's weights. 0 (or n >= n_layer)
+// = all layers. The memory (KV / recurrent state) of layers >= n is not updated while n is set:
+// clear the memory when changing n on a context that holds sequences.
 LLAMA_API void llama_set_n_layer_exit(struct llama_context * ctx, int32_t n);
 
 // LoRA training: a new adapter with trainable F32 tensors. For every 2D weight of the repeating
@@ -138,7 +140,10 @@ LLAMA_API struct llama_adapter_lora * llama_adapter_lora_init_trainable(
 // write the adapter as a GGUF LoRA (loadable with llama_adapter_lora_init / --lora)
 LLAMA_API bool llama_adapter_lora_save(const struct llama_adapter_lora * adapter, const char * path);
 
-// param filter for llama_opt_init: only the tensors of the adapters set on the context
+// param filter for llama_opt_init: only the tensors of the adapters set on the context.
+// Note: llama_opt_init offers the F32 tensors of the adapters set on the context to any filter, so with
+// llama_opt_param_filter_all a loaded F32 adapter is trained along with the model.
+// The parameter flags are cleared again when the training context is freed.
 LLAMA_API bool llama_opt_param_filter_lora(const struct ggml_tensor * tensor, void * userdata);
 
 // mirrors:

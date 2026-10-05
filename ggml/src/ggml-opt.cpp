@@ -724,7 +724,9 @@ void ggml_opt_prepare_alloc(
 
 void ggml_opt_alloc(ggml_opt_context_t opt_ctx, bool backward) {
     GGML_ASSERT(!opt_ctx->eval_ready);
-    if (opt_ctx->build_type == GGML_OPT_BUILD_TYPE_OPT && opt_ctx->opt_period > 1 && opt_ctx->opt_i == 0) {
+    // dynamic graphs: gb_grad of the previous period was freed with its compute context; their
+    // accumulators are zeroed after the rebuild below
+    if (opt_ctx->static_graphs && opt_ctx->build_type == GGML_OPT_BUILD_TYPE_OPT && opt_ctx->opt_period > 1 && opt_ctx->opt_i == 0) {
         ggml_graph_reset(opt_ctx->gb_grad);
     }
     if (backward) {

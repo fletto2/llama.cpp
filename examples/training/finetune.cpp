@@ -115,7 +115,10 @@ int main(int argc, char ** argv) {
     ggml_opt_result_free(result_eval);
 
     if (train_lora) {
-        llama_adapter_lora_save(adapter, params.out_file.empty() ? "lora-adapter.gguf" : params.out_file.c_str());
+        if (!llama_adapter_lora_save(adapter, params.out_file.empty() ? "lora-adapter.gguf" : params.out_file.c_str())) {
+            LOG_ERR("%s: failed to save the LoRA adapter\n", __func__);
+            return 1;
+        }
     } else {
         llama_model_save_to_file(model, params.out_file.c_str());
     }

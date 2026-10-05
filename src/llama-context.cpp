@@ -486,6 +486,17 @@ llama_context::~llama_context() {
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
 
+    // the adapters trained in this context stay usable for inference: drop their parameter flags,
+    // so that later graphs treat them as constant leafs again
+    if (opt_ctx && loras) {
+        for (const auto & it : *loras) {
+            for (const auto & ab : it.first->ab_map) {
+                ab.second.a->flags &= ~GGML_TENSOR_FLAG_PARAM;
+                ab.second.b->flags &= ~GGML_TENSOR_FLAG_PARAM;
+            }
+        }
+    }
+
     // when training, ggml_opt allocates extra buffers through the scheduler, so the sizes no longer match the expectation
     if (!model.hparams.no_alloc && !opt_ctx) {
         for (size_t i = 0; i < backend_ptrs.size(); ++i) {
