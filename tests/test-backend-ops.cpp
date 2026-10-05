@@ -10744,6 +10744,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                                                   256, 16, 16, {ne2, 1}, {1, 1}));
     }
 
+    // non-F32 src0 with a transposed src1: the backward pass of a matmul with frozen (e.g. quantized) weights
+    for (ggml_type type_a : {GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K}) {
+        test_cases.emplace_back(new test_out_prod(type_a, GGML_TYPE_F32, 256, 16, 32, {1, 1}, {1, 1}, true));
+        test_cases.emplace_back(new test_out_prod(type_a, GGML_TYPE_F32, 256, 64, 16, {3, 1}, {1, 1}, true));
+    }
+
     // nr2 sweep to cover the cublasSgemmBatched pointer-array path (dps2 > 1)
     for (int64_t nr2 : {8, 16, 32}) {
         test_cases.emplace_back(new test_out_prod(GGML_TYPE_F32, GGML_TYPE_F32,

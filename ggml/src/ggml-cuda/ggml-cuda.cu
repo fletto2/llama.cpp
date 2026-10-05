@@ -5372,7 +5372,10 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 }
             } break;
         case GGML_OP_OUT_PROD:
-            return op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32;
+            // other src0 types are converted to F32 first (needs a contiguous src0)
+            return op->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
+                (op->src[0]->type == GGML_TYPE_F32 ||
+                 (ggml_is_contiguous(op->src[0]) && ggml_get_to_fp32_cuda(op->src[0]->type) != nullptr));
         case GGML_OP_GET_ROWS:
             {
                 switch (op->src[0]->type) {
