@@ -6771,6 +6771,37 @@ static struct ggml_tensor * ggml_gelu_derivative(struct ggml_context * ctx, stru
     return ggml_add(ctx, d1, d2);
 }
 
+// derivative of the exact GELU (ggml_gelu_erf, ggml_geglu_erf): Phi(x) + x phi(x), with the normal CDF
+// Phi(x) = 0.5 (1 + erf(x / sqrt(2))) and density phi(x) = exp(-x^2 / 2) / sqrt(2 pi). ggml has no erf op, so erf
+// is the Abramowitz-Stegun 7.1.26 approximation (max abs error 1.5e-7) from existing ops:
+// erf(z) = sgn(z) (1 - (a1 t + a2 t^2 + a3 t^3 + a4 t^4 + a5 t^5) exp(-z^2)),  t = 1 / (1 + p |z|)
+static struct ggml_tensor * ggml_gelu_erf_derivative(struct ggml_context * ctx, struct ggml_tensor * x) {
+    const float p  = 0.3275911f;
+    const float a1 = 0.254829592f, a2 = -0.284496736f, a3 = 1.421413741f, a4 = -1.453152027f, a5 = 1.061405429f;
+    const float inv_sqrt2 = 0.70710678118654752440f, inv_sqrt_2pi = 0.39894228040143267794f;
+    struct ggml_tensor * z    = ggml_scale(ctx, x, inv_sqrt2);
+    struct ggml_tensor * ez2  = ggml_exp(ctx, ggml_scale(ctx, ggml_sqr(ctx, z), -1.0f));                    // exp(-z^2) = exp(-x^2/2)
+    struct ggml_tensor * one  = ggml_scale_bias(ctx, z, 0.0f, 1.0f);
+    struct ggml_tensor * t    = ggml_div(ctx, one, ggml_scale_bias(ctx, ggml_abs(ctx, z), p, 1.0f));      // 1 / (1 + p |z|)
+    struct ggml_tensor * poly = ggml_scale_bias(ctx, t, a5, a4);                                          // Horner
+    poly = ggml_scale_bias(ctx, ggml_mul(ctx, poly, t), 1.0f, a3);
+    poly = ggml_scale_bias(ctx, ggml_mul(ctx, poly, t), 1.0f, a2);
+    poly = ggml_scale_bias(ctx, ggml_mul(ctx, poly, t), 1.0f, a1);
+    poly = ggml_mul(ctx, poly, t);
+    struct ggml_tensor * erf  = ggml_mul(ctx, ggml_sgn(ctx, z), ggml_scale_bias(ctx, ggml_mul(ctx, poly, ez2), -1.0f, 1.0f));
+    struct ggml_tensor * cdf  = ggml_scale_bias(ctx, erf, 0.5f, 0.5f);                                    // Phi(x)
+    struct ggml_tensor * xpdf = ggml_scale(ctx, ggml_mul(ctx, x, ez2), inv_sqrt_2pi);                      // x phi(x)
+    return ggml_add(ctx, cdf, xpdf);
+}
+
+// derivative of the quick GELU x sigmoid(1.702 x) (ggml_gelu_quick, ggml_geglu_quick): s + 1.702 x s (1 - s)
+static struct ggml_tensor * ggml_gelu_quick_derivative(struct ggml_context * ctx, struct ggml_tensor * x) {
+    const float k = 1.702f;
+    struct ggml_tensor * s = ggml_sigmoid(ctx, ggml_scale(ctx, x, k));
+    struct ggml_tensor * ds = ggml_mul(ctx, s, ggml_scale_bias(ctx, s, -1.0f, 1.0f));                      // s (1 - s)
+    return ggml_add(ctx, s, ggml_scale(ctx, ggml_mul(ctx, x, ds), k));
+}
+
 static void ggml_compute_backward(
         struct ggml_context * ctx, struct ggml_cgraph * cgraph, int i, const bool * grads_needed) {
     struct ggml_tensor * tensor = cgraph->nodes[i];
@@ -7218,6 +7249,16 @@ static void ggml_compute_backward(
                         ggml_add_or_set(ctx, cgraph, isrc0, ggml_mul(ctx, grad, ggml_gelu_derivative(ctx, src0)));
                     }
                 } break;
+                case GGML_UNARY_OP_GELU_ERF: {
+                    if (src0_needs_grads) {
+                        ggml_add_or_set(ctx, cgraph, isrc0, ggml_mul(ctx, grad, ggml_gelu_erf_derivative(ctx, src0)));
+                    }
+                } break;
+                case GGML_UNARY_OP_GELU_QUICK: {
+                    if (src0_needs_grads) {
+                        ggml_add_or_set(ctx, cgraph, isrc0, ggml_mul(ctx, grad, ggml_gelu_quick_derivative(ctx, src0)));
+                    }
+                } break;
                 default: {
                     fprintf(stderr, "%s: unsupported unary op for backward pass: %s\n",
                         __func__, ggml_unary_op_name(ggml_get_unary_op(tensor)));
@@ -7242,14 +7283,23 @@ static void ggml_compute_backward(
                         ggml_add_or_set(ctx, cgraph, isrc1, ggml_mul(ctx, ggml_silu(ctx, src0), grad));
                     }
                 } break;
-                case GGML_GLU_OP_GEGLU: {
-                    // split geglu: gelu(src0) * src1 (as swiglu above)
+                case GGML_GLU_OP_GEGLU:
+                case GGML_GLU_OP_GEGLU_ERF:
+                case GGML_GLU_OP_GEGLU_QUICK: {
+                    // split geglu: gelu(src0) * src1 (as swiglu above), for the three gelu variants
                     GGML_ASSERT(src1 && ggml_get_op_params_i32(tensor, 1) == 0 && "backward pass only implemented for unswapped split geglu");
+                    const enum ggml_glu_op gop = ggml_get_glu_op(tensor);
                     if (src0_needs_grads) {
-                        ggml_add_or_set(ctx, cgraph, isrc0, ggml_mul(ctx, ggml_mul(ctx, grad, src1), ggml_gelu_derivative(ctx, src0)));
+                        struct ggml_tensor * d = gop == GGML_GLU_OP_GEGLU     ? ggml_gelu_derivative(ctx, src0)
+                                               : gop == GGML_GLU_OP_GEGLU_ERF ? ggml_gelu_erf_derivative(ctx, src0)
+                                                                              : ggml_gelu_quick_derivative(ctx, src0);
+                        ggml_add_or_set(ctx, cgraph, isrc0, ggml_mul(ctx, ggml_mul(ctx, grad, src1), d));
                     }
                     if (src1_needs_grads) {
-                        ggml_add_or_set(ctx, cgraph, isrc1, ggml_mul(ctx, ggml_gelu(ctx, src0), grad));
+                        struct ggml_tensor * g = gop == GGML_GLU_OP_GEGLU     ? ggml_gelu(ctx, src0)
+                                               : gop == GGML_GLU_OP_GEGLU_ERF ? ggml_gelu_erf(ctx, src0)
+                                                                              : ggml_gelu_quick(ctx, src0);
+                        ggml_add_or_set(ctx, cgraph, isrc1, ggml_mul(ctx, g, grad));
                     }
                 } break;
                 default: {

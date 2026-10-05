@@ -60,7 +60,7 @@ It also fixes two problems in upstream training code:
 
 **Limits:**
 - There's no backward pass for flash attention (it's switched off during training), for `MUL_MAT_ID` (no MoE), or for the Gated DeltaNet / SSM ops.
-- GELU and GEGLU (tanh form) have a backward pass in this fork, so Gemma-family models train. Gemma 3 270M F32 matches PyTorch within 2e-4 in loss and 0.3% in the trained weights after two SGD steps, on CPU and GPU.
+- The GELU family has a backward pass in this fork: GELU (tanh form), GELU-erf and GELU-quick, plus their split GEGLU forms, built from existing ops (erf via the Abramowitz–Stegun approximation, error 1.5e-7), so Gemma-family models train. Gemma 3 270M F32 matches PyTorch within 2e-4 in loss and 0.3% in the trained weights after two SGD steps, on CPU and GPU.
 - Training needs `n_ubatch == n_ctx`, or the K and V projections get no gradient.
 
 ## llama-server
