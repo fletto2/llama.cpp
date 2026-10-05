@@ -6757,6 +6757,20 @@ static void ggml_sub_or_set(
     ggml_build_forward_expand(cgraph, cgraph->grads[isrc]);
 }
 
+// derivative of the tanh-approximated GELU (ggml_gelu, ggml_geglu), built from existing ops:
+// gelu'(x) = 0.5 (1 + t) + 0.5 x (1 - t^2) c (1 + 3 a x^2),   t = tanh(c x (1 + a x^2)),   c = sqrt(2/pi), a = 0.044715
+static struct ggml_tensor * ggml_gelu_derivative(struct ggml_context * ctx, struct ggml_tensor * x) {
+    const float a = 0.044715f;
+    const float c = 0.79788456080286535587989211986876f;
+    struct ggml_tensor * x2 = ggml_sqr(ctx, x);
+    struct ggml_tensor * t  = ggml_tanh(ctx, ggml_scale(ctx, ggml_mul(ctx, x, ggml_scale_bias(ctx, x2, a, 1.0f)), c));
+    struct ggml_tensor * d1 = ggml_scale_bias(ctx, t, 0.5f, 0.5f);                             // 0.5 (1 + t)
+    struct ggml_tensor * s  = ggml_scale_bias(ctx, ggml_sqr(ctx, t), -1.0f, 1.0f);             // 1 - t^2
+    struct ggml_tensor * p  = ggml_scale_bias(ctx, x2, 3.0f*a, 1.0f);                          // 1 + 3 a x^2
+    struct ggml_tensor * d2 = ggml_scale(ctx, ggml_mul(ctx, ggml_mul(ctx, x, s), p), 0.5f*c);  // 0.5 c x (1 - t^2) (1 + 3 a x^2)
+    return ggml_add(ctx, d1, d2);
+}
+
 static void ggml_compute_backward(
         struct ggml_context * ctx, struct ggml_cgraph * cgraph, int i, const bool * grads_needed) {
     struct ggml_tensor * tensor = cgraph->nodes[i];
@@ -7199,6 +7213,11 @@ static void ggml_compute_backward(
                         ggml_add_or_set(ctx, cgraph, isrc0, ggml_mul(ctx, grad, ggml_sigmoid(ctx, src0)));
                     }
                 } break;
+                case GGML_UNARY_OP_GELU: {
+                    if (src0_needs_grads) {
+                        ggml_add_or_set(ctx, cgraph, isrc0, ggml_mul(ctx, grad, ggml_gelu_derivative(ctx, src0)));
+                    }
+                } break;
                 default: {
                     fprintf(stderr, "%s: unsupported unary op for backward pass: %s\n",
                         __func__, ggml_unary_op_name(ggml_get_unary_op(tensor)));
@@ -7221,6 +7240,16 @@ static void ggml_compute_backward(
                     }
                     if (src1_needs_grads) {
                         ggml_add_or_set(ctx, cgraph, isrc1, ggml_mul(ctx, ggml_silu(ctx, src0), grad));
+                    }
+                } break;
+                case GGML_GLU_OP_GEGLU: {
+                    // split geglu: gelu(src0) * src1 (as swiglu above)
+                    GGML_ASSERT(src1 && ggml_get_op_params_i32(tensor, 1) == 0 && "backward pass only implemented for unswapped split geglu");
+                    if (src0_needs_grads) {
+                        ggml_add_or_set(ctx, cgraph, isrc0, ggml_mul(ctx, ggml_mul(ctx, grad, src1), ggml_gelu_derivative(ctx, src0)));
+                    }
+                    if (src1_needs_grads) {
+                        ggml_add_or_set(ctx, cgraph, isrc1, ggml_mul(ctx, ggml_gelu(ctx, src0), grad));
                     }
                 } break;
                 default: {
