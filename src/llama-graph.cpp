@@ -1492,7 +1492,8 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     cparams          (params.cparams),
     ubatch           (params.ubatch),
     n_embd           (hparams.n_embd),
-    n_layer          (hparams.n_layer()),
+    n_layer          (params.cparams.n_layer_exit > 0 && (uint32_t) params.cparams.n_layer_exit < hparams.n_layer()
+                          ? (int64_t) params.cparams.n_layer_exit : (int64_t) hparams.n_layer()),
     n_layer_nextn    (hparams.n_layer_nextn),
     n_rot            (hparams.n_rot()),
     n_ctx            (cparams.n_ctx),

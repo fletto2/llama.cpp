@@ -114,6 +114,10 @@ enum llama_decision_order {
 // The embeddings output has one value per entry: row i is the score of option i
 LLAMA_API bool llama_batch_ext_set_decision_order(struct llama_batch_ext * batch, int32_t idx, enum llama_decision_order order);
 
+// Early exit: n > 0 builds the trunk graph only up to n layers (then output_norm, pooling /
+// LM head as usual), e.g. for a classifier context sharing the model's weights. 0 = all layers.
+LLAMA_API void llama_set_n_layer_exit(struct llama_context * ctx, int32_t n);
+
 // mirrors:
 // LLAMA_API float * llama_get_embeddings(struct llama_context * ctx);
 LLAMA_API float * llama_get_embeddings_nextn(struct llama_context * ctx);
