@@ -736,6 +736,17 @@ void ggml_opt_alloc(ggml_opt_context_t opt_ctx, bool backward) {
 
     if (!opt_ctx->static_graphs) {
         ggml_opt_build(opt_ctx);
+
+        // a new gradient accumulation period starts: zero the accumulated gradients of the parameters.
+        // With static graphs ggml_graph_reset does this above; dynamic graphs are rebuilt for every
+        // evaluation, so the gb_grad of the previous period no longer exists.
+        if (backward && opt_ctx->opt_i == 0 && !opt_ctx->grad_accs.empty()) {
+            for (int i = 0; i < opt_ctx->gf->n_nodes; ++i) {
+                if (opt_ctx->grad_accs[i] && (opt_ctx->gf->nodes[i]->flags & GGML_TENSOR_FLAG_PARAM)) {
+                    ggml_set_zero(opt_ctx->grad_accs[i]);
+                }
+            }
+        }
     }
 
     struct ggml_cgraph * graph = nullptr;
