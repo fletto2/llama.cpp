@@ -40,7 +40,7 @@ llama-finetune -m base.gguf -f train.txt -c 256 -b 256 -ub 256 \
 llama-cli -m base.gguf --lora adapter.gguf      # or llama-server --lora, llama-export-lora to merge
 ```
 
-- **What gets adapted:** `--lora-rank` trains a new adapter on the attention and FFN matrices of every layer, with the base model frozen. The base can be F32 or quantized (tested: F32 and Q4_K_M); the backward pass reads the quantized weights directly, on the CPU.
+- **What gets adapted:** `--lora-rank` trains a new adapter on the attention and FFN matrices of every layer, with the base model frozen. The base can be F32 or quantized (tested: F32 and Q4_K_M), on CPU or GPU. On the GPU, quantized weights are dequantized for the backward pass.
 - **Initialisation:** as PEFT does it. A is uniform in ±1/sqrt(n_in) and B = 0, so the adapter starts as a no-op. The output is scaled by alpha / rank.
 - **API** (`src/llama-ext.h`):
   - `llama_adapter_lora_init_trainable()` creates the adapter.
@@ -60,5 +60,46 @@ It also fixes two problems in upstream training code:
 
 **Limits:**
 - There's no backward pass for flash attention (it's switched off during training), for `MUL_MAT_ID` (no MoE), or for the Gated DeltaNet / SSM ops.
-- On CUDA, `OUT_PROD` supports F32 weights only.
 - Training needs `n_ubatch == n_ctx`, or the K and V projections get no gradient.
+
+## llama-server
+
+```sh
+llama-server -m model.gguf --classifier head.gguf [--classifier head2.gguf] --lora-train
+```
+
+### Classifier
+
+**Head format.** A head is a small GGUF file with:
+- `general.type = classifier`
+- `classifier.layer` (u32): the exit layer L
+- `classifier.question_id`
+- `classifier.type = noul`
+- `classifier.weight` F32 [n_embd] and `classifier.bias` F32 [1]
+
+The feature is the residual after layer L, mean-pooled over the input. Heads that read the same layer share one early-exit context on the loaded model.
+
+**Request:** `POST /classify` with `{"input": "text"}`, a token array, or an array of either. The response:
+
+```json
+{"model": "...", "answers": {"<question_id>": {"type": "noul", "noul": 0.97}}, "usage": {"input_tokens": 35, "output_tokens": 0}}
+```
+
+### LoRA training
+
+`POST /lora/train` starts a job on the loaded model. The body fields:
+- `text` or `tokens`
+- `rank`, `alpha`, `lr`, `epochs`, `n_ctx` (a multiple of 256), `targets`, `name`, `path`, `seed`
+- `priority`:
+  - `idle` (default): train only while no request is being processed
+  - `shared`: also train between decode rounds
+
+Training runs in its own context, one optimizer step per server-loop iteration.
+
+**When the job finishes:**
+- The adapter is saved to `path`, or to a temporary file, so that it is reloaded with the model after sleeping.
+- It is added to `/lora-adapters` with scale 0. A request uses it with `"lora": [{"id": <adapter_id>, "scale": 1}]`.
+
+`GET /lora/train` lists the jobs (step, losses, adapter id). `POST /lora/train/cancel` with `{"id": n}` cancels one.
+
+With `--lora-train`, weight repacking is turned off.
