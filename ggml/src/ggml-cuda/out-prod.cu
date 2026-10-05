@@ -52,8 +52,41 @@ void ggml_cuda_out_prod(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     cudaStream_t   stream = ctx.stream();
     cublasHandle_t handle = ctx.cublas_handle();
 
-    // other types of src0 (quantized, F16, BF16; e.g. frozen weights in the backward pass of LoRA training)
-    // are converted to a contiguous F32 copy first
+    // a single GEMM with a non-F32 src0 (the backward pass of a matmul with frozen weights, e.g. in LoRA
+    // training): convert src0 in chunks of rows along the reduction dimension (ne01) and accumulate into dst,
+    // so that the F32 copy stays at most 256 MiB (the whole output.weight of an 8B model would be ~2.5 GB)
+    if (src0->type != GGML_TYPE_F32 && ne2 == 1 && ne3 == 1 && ne02 == 1 && ne03 == 1) {
+        const to_fp32_cuda_t to_fp32 = ggml_get_to_fp32_cuda(src0->type);
+        GGML_ASSERT(to_fp32 != nullptr);
+
+        const bool              src1_T = ggml_is_transposed(src1);
+        const cublasOperation_t op1    = src1_T ? CUBLAS_OP_N : CUBLAS_OP_T;
+        const int64_t           ldb    = (src1_T ? nb10 : nb11) / sizeof(float);
+        GGML_ASSERT(                     (src1_T ? nb11 : nb10) == sizeof(float));
+        const int64_t           ldc    = nb1 / sizeof(float);
+
+        const int64_t kc_max = std::max<int64_t>(1, (int64_t(64) << 20) / ne00); // rows per chunk (64 Mi floats)
+        ggml_cuda_pool_alloc<float> chunk(ctx.pool(), std::min(kc_max, ne01) * ne00);
+
+        const float alpha = 1.0f;
+        for (int64_t k0 = 0; k0 < ne01; k0 += kc_max) {
+            const int64_t kc = std::min(kc_max, ne01 - k0);
+            to_fp32((const char *) src0->data + k0*nb01, chunk.get(), kc*ne00, stream);
+            CUDA_CHECK(cudaGetLastError());
+            const float   beta = k0 == 0 ? 0.0f : 1.0f;
+            // element (k, n) of op(B) is at src1_d + k + n*ldb (src1 transposed) or n + k*ldb (otherwise)
+            const float * b    = src1_d + (src1_T ? k0 : k0*ldb);
+            CUBLAS_CHECK(
+                cublasSgemm(handle, CUBLAS_OP_N, op1,
+                        ne0, ne1, kc,
+                        &alpha, chunk.get(), ne00,
+                                b,           ldb,
+                        &beta,  dst_d,       ldc));
+        }
+        return;
+    }
+
+    // other types of src0 (quantized, F16, BF16) in the batched paths are converted to a contiguous F32 copy first
     size_t src0_nb1 = nb01;
     size_t src0_nb2 = nb02;
     size_t src0_nb3 = nb03;
