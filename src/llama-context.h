@@ -295,6 +295,7 @@ private:
     llama_adapter_loras_ptr loras;
 
     bool training_graph = false; // set by opt_init: graphs also hold the backward pass and the optimizer step
+    uint32_t opt_n_ctx_train = 0; // set by opt_init: tokens per training datapoint
 
     llama_cross cross; // TODO: tmp for handling cross-attention - need something better probably
 

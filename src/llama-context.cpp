@@ -3538,10 +3538,11 @@ static void llama_set_param(struct ggml_tensor * tensor, llama_opt_param_filter 
 
 void llama_context::opt_init(struct llama_model * model, struct llama_opt_params lopt_params) {
     GGML_ASSERT(!opt_ctx);
-    model->hparams.n_ctx_train = lopt_params.n_ctx_train > 0 ? lopt_params.n_ctx_train : n_ctx();
-    const uint32_t n_batch     = std::min(this->n_batch(),  model->hparams.n_ctx_train);
+    // the training context length belongs to this context: the model may be shared with other contexts
+    opt_n_ctx_train = lopt_params.n_ctx_train > 0 ? lopt_params.n_ctx_train : n_ctx();
+    const uint32_t n_batch     = std::min(this->n_batch(),  opt_n_ctx_train);
     const uint32_t n_ubatch    = std::min(this->n_ubatch(), n_batch);
-    GGML_ASSERT(model->hparams.n_ctx_train % n_batch  == 0);
+    GGML_ASSERT(opt_n_ctx_train % n_batch  == 0);
     GGML_ASSERT(n_batch                    % n_ubatch == 0);
 
     if (cparams.flash_attn) {
@@ -3615,7 +3616,7 @@ void llama_context::opt_epoch_iter(
         int64_t                          ndata_in_loop,
         int64_t                          t_loop_start) {
     GGML_ASSERT(opt_ctx);
-    const uint32_t n_ctx    = llama_model_n_ctx_train(&model);
+    const uint32_t n_ctx    = opt_n_ctx_train;
     const uint32_t n_batch  = std::min(this->n_batch(),  n_ctx);
     const uint32_t n_ubatch = std::min(this->n_ubatch(), n_batch);
 
