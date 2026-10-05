@@ -3,7 +3,8 @@
 This is [llama.cpp](https://github.com/ggml-org/llama.cpp) plus a few small patches:
 
 - **Per-context early exit:** a classifier and text generation can share one loaded model.
-- **LoRA training:** train a LoRA adapter in C/C++ on a frozen base model, including a quantized one, and save it as a GGUF adapter that `--lora` loads.
+- **LoRA training:** train a LoRA adapter in C/C++ on a frozen base model, including a quantized one, on CPU or GPU, and save it as a GGUF adapter that `--lora` loads.
+- **llama-server:** classifier heads (`--classifier`, `POST /classify`) and LoRA training on the loaded model between requests (`--lora-train`, `POST /lora/train`).
 
 Everything else is unchanged upstream code. For building, models, tools and the full documentation, see the [official llama.cpp README](https://github.com/ggml-org/llama.cpp/blob/master/README.md).
 
