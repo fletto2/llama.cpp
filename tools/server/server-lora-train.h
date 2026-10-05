@@ -4,8 +4,12 @@
 //
 // A job trains a new adapter (llama_adapter_lora_init_trainable) in its own training context on the
 // model that the server already holds, one optimizer step per iteration of the server loop, so that
-// generation continues meanwhile. When it finishes, the adapter is saved (if a path was given) and added
-// to the server's LoRA adapters with scale 0; requests select it with "lora": [{"id": <id>, "scale": 1}].
+// generation continues meanwhile. When it finishes, the adapter is saved to <--lora-train-dir>/<file>
+// and, unless "register": false, added to the server's LoRA adapters with scale 0; requests select it
+// with "lora": [{"id": <id>, "scale": 1}].
+//
+// Only models whose ops all have a backward pass can be trained: not recurrent / hybrid (SSM, DeltaNet)
+// models, not MoE models (MUL_MAT_ID) and not diffusion models; such jobs are rejected.
 
 #include "llama.h"
 #include "ggml-opt.h"
@@ -18,7 +22,8 @@
 struct server_lora_train_job {
     int         id     = 0;
     std::string name;
-    std::string path;            // output file (default: a temporary file, so that the adapter survives a model reload)
+    std::string path;            // output file: <dir>/<file>; also lets a registered adapter be reloaded after sleeping
+    bool        do_register = true; // add the adapter to the server's adapters (false: only save it)
     std::string status = "queued"; // queued, running, done, error, cancelled
     std::string error;
 
@@ -49,6 +54,7 @@ struct server_lora_train_job {
 };
 
 struct server_lora_train {
+    explicit server_lora_train(std::string dir) : dir(std::move(dir)) {}
     ~server_lora_train();
 
     // validate a request and queue a job; returns the job id. Throws std::invalid_argument on bad input.
@@ -74,6 +80,7 @@ private:
     void setup();
     void finish(const std::string & status, const std::string & error = "");
 
+    std::string dir; // where adapters are written (--lora-train-dir)
     llama_model * model = nullptr;
     int32_t n_threads = 0;
     int next_id = 1;

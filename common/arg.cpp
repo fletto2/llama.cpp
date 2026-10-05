@@ -3828,6 +3828,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--lora-train-dir"}, "PATH",
+        "directory for adapters trained with POST /lora/train (default: <temp dir>/llama-lora-train)",
+        [](common_params & params, const std::string & value) {
+            params.lora_train_dir = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--lora-init-without-apply"},
         string_format("load LoRA adapters without applying them (apply later via POST /lora-adapters) (default: %s)", params.lora_init_without_apply ? "enabled" : "disabled"),
         [](common_params & params) {

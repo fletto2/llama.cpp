@@ -1248,7 +1248,8 @@ private:
             }
         }
         if (params_base.lora_train) {
-            lora_train = std::make_unique<server_lora_train>();
+            lora_train = std::make_unique<server_lora_train>(!params_base.lora_train_dir.empty() ? params_base.lora_train_dir :
+                (std::filesystem::temp_directory_path() / "llama-lora-train").string());
         }
 
         try {

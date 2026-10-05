@@ -39,7 +39,12 @@ struct server_classifier_ctx {
             return false; // stop the graph
         }
         const int64_t n_rows = ggml_nelements(t) / n_embd;
-        self->buf.resize(ggml_nelements(t));
+        try {
+            self->buf.resize(ggml_nelements(t));
+        } catch (const std::exception & e) {
+            self->error = std::string("classifier: ") + e.what();
+            return false;
+        }
         ggml_backend_tensor_get(t, self->buf.data(), 0, ggml_nbytes(t));
         for (int64_t r = 0; r < n_rows; r++) {
             const float * row = self->buf.data() + r*n_embd;
@@ -67,7 +72,13 @@ static server_classifier_head load_head(const std::string & path) {
     }
     auto get_str = [&](const char * key, const char * def) -> std::string {
         const int64_t id = gguf_find_key(ctx, key);
-        return id < 0 ? std::string(def) : std::string(gguf_get_val_str(ctx, id));
+        if (id < 0) {
+            return def;
+        }
+        if (gguf_get_kv_type(ctx, id) != GGUF_TYPE_STRING) {
+            throw std::runtime_error(std::string(key) + " is not a string");
+        }
+        return gguf_get_val_str(ctx, id);
     };
 
     server_classifier_head head;
@@ -80,7 +91,11 @@ static server_classifier_head load_head(const std::string & path) {
         if (id_layer < 0) {
             throw std::runtime_error("classifier.layer is missing");
         }
-        head.layer       = (int32_t) gguf_get_val_u32(ctx, id_layer);
+        switch (gguf_get_kv_type(ctx, id_layer)) {
+            case GGUF_TYPE_UINT32: head.layer = (int32_t) gguf_get_val_u32(ctx, id_layer); break;
+            case GGUF_TYPE_INT32:  head.layer =           gguf_get_val_i32(ctx, id_layer); break;
+            default: throw std::runtime_error("classifier.layer is not a 32-bit integer");
+        }
         head.question_id = get_str("classifier.question_id", "relevant");
         head.type        = get_str("classifier.type", "noul");
         if (head.type != "noul") {
@@ -104,8 +119,10 @@ static server_classifier_head load_head(const std::string & path) {
 }
 
 void server_classifier::init(llama_model * model, const std::vector<std::string> & paths, int32_t n_ctx, int32_t n_threads) {
-    this->model  = model;
-    this->n_embd = llama_model_n_embd(model);
+    this->model   = model;
+    this->n_embd  = llama_model_n_embd(model);
+    this->n_ctx   = n_ctx;
+    this->n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
     const int32_t n_layer = llama_model_n_layer(model);
 
     for (const auto & path : paths) {
@@ -161,12 +178,17 @@ json server_classifier::classify(const llama_tokens & tokens) {
     if (tokens.empty()) {
         throw std::invalid_argument("classifier: empty input");
     }
+    if ((int64_t) tokens.size() > n_ctx) {
+        throw std::invalid_argument("classifier: input has " + std::to_string(tokens.size()) +
+                                    " tokens, at most " + std::to_string(n_ctx) + " are allowed (--classifier-ctx)");
+    }
+    for (const llama_token t : tokens) {
+        if (t < 0 || t >= n_vocab) {
+            throw std::invalid_argument("classifier: token id " + std::to_string(t) + " is outside the vocabulary");
+        }
+    }
     json answers = json::object();
     for (auto & c : ctxs) {
-        if (tokens.size() > llama_n_ctx(c->ctx)) {
-            throw std::invalid_argument("classifier: input has " + std::to_string(tokens.size()) +
-                                        " tokens, the classifier context holds " + std::to_string(llama_n_ctx(c->ctx)));
-        }
         std::fill(c->sum.begin(), c->sum.end(), 0.0);
         c->rows = 0;
         c->error.clear();

@@ -22,6 +22,7 @@ json server_lora_train_job::to_json() const {
         {"epochs",     epochs},
         {"n_ctx",      n_ctx},
         {"priority",   shared ? "shared" : "idle"},
+        {"register",   do_register},
         {"n_tokens",   (int64_t) tokens.size()},
         {"loss_first", loss_first},
         {"loss_last",  loss_last},
@@ -58,9 +59,19 @@ int server_lora_train::start(llama_model * model, const llama_vocab * vocab, con
     if (job) {
         throw std::invalid_argument("a LoRA training job is already running (id " + std::to_string(job->id) + ")");
     }
+    // ops without a backward pass would abort the process inside ggml
+    if (llama_model_is_recurrent(model) || llama_model_is_hybrid(model) || llama_model_is_diffusion(model) ||
+        llama_model_n_expert(model) > 0) {
+        throw std::invalid_argument("this model cannot be trained: recurrent, hybrid (SSM / DeltaNet), MoE and diffusion "
+                                    "models use ops without a backward pass");
+    }
     auto j = std::make_unique<server_lora_train_job>();
     j->name    = json_value(body, "name",    std::string());
-    j->path    = json_value(body, "path",    std::string());
+    const std::string file = json_value(body, "file", std::string());
+    if (!file.empty() && !fs_validate_filename(file)) {
+        throw std::invalid_argument("\"file\" must be a plain file name; it is written to the --lora-train-dir directory");
+    }
+    j->do_register = json_value(body, "register", true);
     j->rank    = json_value(body, "rank",    j->rank);
     j->alpha   = json_value(body, "alpha",   (float) (2*j->rank));
     j->lr      = json_value(body, "lr",      j->lr);
@@ -88,17 +99,23 @@ int server_lora_train::start(llama_model * model, const llama_vocab * vocab, con
     } else {
         throw std::invalid_argument("\"text\" or \"tokens\" is required");
     }
+    const int32_t n_vocab = llama_vocab_n_tokens(vocab);
+    for (const llama_token t : j->tokens) {
+        if (t < 0 || t >= n_vocab) {
+            throw std::invalid_argument("token id " + std::to_string(t) + " is outside the vocabulary (0.." + std::to_string(n_vocab - 1) + ")");
+        }
+    }
     if ((int64_t) j->tokens.size() < j->n_ctx + 1) {
         throw std::invalid_argument("the training data has " + std::to_string(j->tokens.size()) +
                                     " tokens, at least n_ctx + 1 = " + std::to_string(j->n_ctx + 1) + " are needed");
     }
     j->n_steps = n_windows(*j) * j->epochs;
     j->id = next_id++;
-    if (j->path.empty()) {
-        j->path = (std::filesystem::temp_directory_path() /
-                   ("llama-lora-train-" + std::to_string(std::chrono::system_clock::now().time_since_epoch().count()) +
-                    "-" + std::to_string(j->id) + ".gguf")).string();
-    }
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    j->path = (std::filesystem::path(dir) / (file.empty()
+        ? "lora-" + std::to_string(std::chrono::system_clock::now().time_since_epoch().count()) + "-" + std::to_string(j->id) + ".gguf"
+        : file)).string();
 
     this->model     = model;
     this->n_threads = n_threads;
@@ -205,9 +222,14 @@ llama_adapter_lora * server_lora_train::step() {
             throw std::runtime_error("cannot write " + job->path);
         }
         llama_adapter_lora * done = adapter;
-        adapter = nullptr; // now owned by the server's adapter list
-        finish("done");
-        return done;
+        adapter = nullptr;
+        const bool do_register = job->do_register;
+        finish("done"); // frees the training context, which clears the adapter's parameter flags
+        if (!do_register) {
+            llama_adapter_lora_free(done); // saved only
+            return nullptr;
+        }
+        return done; // now owned by the server's adapter list
     } catch (const std::exception & e) {
         finish("error", e.what());
         return nullptr;

@@ -28,7 +28,7 @@ To use it as a classifier:
 1. Load the model once and create both contexts from it.
 2. Read the residual after layer `L-1` (graph tensor `l_out-<L-1>`) with an eval callback (`cb_eval`), and mean-pool it over the item's tokens. You can also set `pooling_type = LLAMA_POOLING_TYPE_MEAN` and read the pooled embedding. That output passes through `output_norm`, so it is the normalised version of the same feature.
 3. Train a linear head, e.g. logistic regression, on those features: `p = sigmoid(w·x + b)`.
-4. At run time, send items to the classifier context. The generation context's prompt prefill passes through the same layer, so a generation request can also be classified at no extra cost.
+4. At run time, send items to the classifier context. The generation context's prompt prefill passes through the same layer, so a program using the C API can also classify a generation request from its own prefill at no extra cost. (llama-server's `/classify` always runs the input through the classifier context.)
 
 The middle layers usually make the best classifier features. Pick `L` by cross-validation on your own data.
 
@@ -79,6 +79,8 @@ llama-server -m model.gguf --classifier head.gguf [--classifier head2.gguf] --lo
 
 The feature is the residual after layer L, mean-pooled over the input. Heads that read the same layer share one early-exit context on the loaded model.
 
+**Memory:** each distinct layer costs one context of `--classifier-ctx` tokens (default 4096). Its KV cache covers all layers, because early exit doesn't shrink it, plus a compute buffer of that size. Lower `--classifier-ctx` when inputs are short.
+
 **Request:** `POST /classify` with `{"input": "text"}`, a token array, or an array of either. The response:
 
 ```json
@@ -89,7 +91,9 @@ The feature is the residual after layer L, mean-pooled over the input. Heads tha
 
 `POST /lora/train` starts a job on the loaded model. The body fields:
 - `text` or `tokens`
-- `rank`, `alpha`, `lr`, `epochs`, `n_ctx` (a multiple of 256), `targets`, `name`, `path`, `seed`
+- `rank`, `alpha` (default 2·rank, unlike `llama-finetune`, where the default is rank), `lr`, `epochs`, `n_ctx` (a multiple of 256), `targets`, `name`, `seed`
+- `file`: a plain file name inside `--lora-train-dir` (default `<temp dir>/llama-lora-train`)
+- `register`: `false` saves the adapter without adding it to the server
 - `priority`:
   - `idle` (default): train only while no request is being processed
   - `shared`: also train between decode rounds
@@ -97,9 +101,13 @@ The feature is the residual after layer L, mean-pooled over the input. Heads tha
 Training runs in its own context, one optimizer step per server-loop iteration.
 
 **When the job finishes:**
-- The adapter is saved to `path`, or to a temporary file, so that it is reloaded with the model after sleeping.
+- The adapter is saved to the training dir. A registered adapter is reloaded from that file after the server sleeps, so keep the file.
 - It is added to `/lora-adapters` with scale 0. A request uses it with `"lora": [{"id": <adapter_id>, "scale": 1}]`.
 
 `GET /lora/train` lists the jobs (step, losses, adapter id). `POST /lora/train/cancel` with `{"id": n}` cancels one.
 
 With `--lora-train`, weight repacking is turned off.
+
+Recurrent, hybrid (SSM / DeltaNet), MoE and diffusion models are rejected: some of their ops have no backward pass.
+
+The training context (F32 KV cache, AdamW state, the backward graph) needs memory on top of the served model.

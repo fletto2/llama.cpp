@@ -46,6 +46,8 @@ struct server_classifier {
 
 private:
     llama_model * model = nullptr;
-    int32_t n_embd = 0;
+    int32_t n_embd  = 0;
+    int32_t n_ctx   = 0; // requested maximum input length (the context itself is padded to a multiple of 256)
+    int32_t n_vocab = 0;
     std::vector<std::unique_ptr<server_classifier_ctx>> ctxs;
 };
