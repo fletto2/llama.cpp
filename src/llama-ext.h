@@ -118,6 +118,29 @@ LLAMA_API bool llama_batch_ext_set_decision_order(struct llama_batch_ext * batch
 // LM head as usual), e.g. for a classifier context sharing the model's weights. 0 = all layers.
 LLAMA_API void llama_set_n_layer_exit(struct llama_context * ctx, int32_t n);
 
+// LoRA training: a new adapter with trainable F32 tensors. For every 2D weight of the repeating
+// layers whose name matches one of the targets ("blk.N.<target>.weight"), A [n_in, rank] is
+// initialised like PEFT (uniform in +-1/sqrt(n_in)) and B [rank, n_out] is zero, so the adapter
+// starts as a no-op. Its output is scaled by alpha / rank, as for loaded adapters.
+// Set it on the context (llama_set_adapters_lora), then train it with llama_opt_init using
+// llama_opt_param_filter_lora, and save it with llama_adapter_lora_save.
+struct llama_adapter_lora_train_params {
+    int32_t      rank;    // > 0
+    float        alpha;   // 0 = rank (scale 1)
+    const char * targets; // comma-separated, NULL = "attn_q,attn_k,attn_v,attn_output,ffn_gate,ffn_up,ffn_down"
+    uint32_t     seed;
+};
+
+LLAMA_API struct llama_adapter_lora * llama_adapter_lora_init_trainable(
+        struct llama_model * model,
+        struct llama_adapter_lora_train_params params);
+
+// write the adapter as a GGUF LoRA (loadable with llama_adapter_lora_init / --lora)
+LLAMA_API bool llama_adapter_lora_save(const struct llama_adapter_lora * adapter, const char * path);
+
+// param filter for llama_opt_init: only the tensors of the adapters set on the context
+LLAMA_API bool llama_opt_param_filter_lora(const struct ggml_tensor * tensor, void * userdata);
+
 // mirrors:
 // LLAMA_API float * llama_get_embeddings(struct llama_context * ctx);
 LLAMA_API float * llama_get_embeddings_nextn(struct llama_context * ctx);

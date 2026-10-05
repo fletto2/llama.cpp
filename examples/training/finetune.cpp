@@ -2,6 +2,7 @@
 #include "common.h"
 #include "log.h"
 #include "llama.h"
+#include "../../src/llama-ext.h" // staging API: LoRA training
 
 #include <clocale>
 #include <cmath>
@@ -26,7 +27,11 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    if (params.load_mode != LLAMA_LOAD_MODE_NONE) {
+    const bool train_lora = params.lora_train_rank > 0;
+    if (train_lora) {
+        // the backward pass reads the frozen weights through OUT_PROD, which repacked layouts do not support
+        params.no_extra_bufts = true;
+    } else if (params.load_mode != LLAMA_LOAD_MODE_NONE) {
         LOG_INF("%s: forcing load_mode = none to enable writable pointers to the weights\n", __func__);
         params.load_mode = LLAMA_LOAD_MODE_NONE;
     }
@@ -58,6 +63,23 @@ int main(int argc, char ** argv) {
         LOG_INF("%s\n", common_params_get_system_info(params).c_str());
     }
 
+    llama_adapter_lora * adapter = nullptr;
+    if (train_lora) {
+        const llama_adapter_lora_train_params lparams = {
+            /*rank    =*/ params.lora_train_rank,
+            /*alpha   =*/ params.lora_train_alpha,
+            /*targets =*/ params.lora_train_targets.empty() ? nullptr : params.lora_train_targets.c_str(),
+            /*seed    =*/ params.sampling.seed,
+        };
+        adapter = llama_adapter_lora_init_trainable(model, lparams);
+        if (!adapter) {
+            LOG_ERR("%s: unable to create the LoRA adapter\n", __func__);
+            return 1;
+        }
+        float scale = 1.0f;
+        llama_set_adapters_lora(ctx, &adapter, 1, &scale);
+    }
+
     std::vector<llama_token> tokens  = common_tokenize(ctx, params.prompt, true);
     ggml_opt_dataset_t       dataset = common_opt_dataset_init(ctx, tokens, llama_n_ctx(ctx) / 2);
 
@@ -68,7 +90,7 @@ int main(int argc, char ** argv) {
 
     struct llama_opt_params lopt_params{
         /*n_ctx_train     =*/0,
-        /*param_filter    =*/llama_opt_param_filter_all,
+        /*param_filter    =*/train_lora ? llama_opt_param_filter_lora : llama_opt_param_filter_all,
         /*param_filter_ud =*/nullptr,
         /*get_opt_pars    =*/common_opt_lr_pars,
         /*get_opt_pars_ud =*/&params.lr,
@@ -92,7 +114,11 @@ int main(int argc, char ** argv) {
     ggml_opt_result_free(result_train);
     ggml_opt_result_free(result_eval);
 
-    llama_model_save_to_file(model, params.out_file.c_str());
+    if (train_lora) {
+        llama_adapter_lora_save(adapter, params.out_file.empty() ? "lora-adapter.gguf" : params.out_file.c_str());
+    } else {
+        llama_model_save_to_file(model, params.out_file.c_str());
+    }
 
     llama_backend_free();
 

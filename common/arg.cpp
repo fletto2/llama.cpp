@@ -4539,6 +4539,21 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params, int epochs) { params.lr.epochs = epochs; }
     ).set_examples({ LLAMA_EXAMPLE_FINETUNE }));
     add_opt(common_arg(
+        {"--lora-rank"}, "N",
+        "train a new LoRA adapter of rank N instead of the full model; -o sets the adapter file (default: off)",
+        [](common_params & params, int value) { params.lora_train_rank = value; }
+    ).set_examples({ LLAMA_EXAMPLE_FINETUNE }));
+    add_opt(common_arg(
+        {"--lora-alpha"}, "F",
+        "LoRA alpha, the adapter output is scaled by alpha / rank (default: rank)",
+        [](common_params & params, const std::string & value) { params.lora_train_alpha = std::stof(value); }
+    ).set_examples({ LLAMA_EXAMPLE_FINETUNE }));
+    add_opt(common_arg(
+        {"--lora-targets"}, "LIST",
+        "comma-separated weights to adapt (default: attn_q,attn_k,attn_v,attn_output,ffn_gate,ffn_up,ffn_down)",
+        [](common_params & params, const std::string & value) { params.lora_train_targets = value; }
+    ).set_examples({ LLAMA_EXAMPLE_FINETUNE }));
+    add_opt(common_arg(
         {"-opt", "--optimizer"}, "sgd|adamw", "adamw or sgd",
         [](common_params & params, const std::string & name) {
             params.optimizer = common_opt_get_optimizer(name.c_str());

@@ -614,6 +614,9 @@ struct common_params {
     struct lr_opt lr;
     enum ggml_opt_optimizer_type optimizer = GGML_OPT_OPTIMIZER_TYPE_ADAMW;
     float val_split = 0.05f; // fraction of the data used for the validation set
+    int32_t     lora_train_rank    = 0;  // > 0: train a new LoRA adapter of this rank instead of the full model
+    float       lora_train_alpha   = 0;  // 0 = rank
+    std::string lora_train_targets = ""; // comma-separated weight names, empty = attention + FFN matrices
 
     // embedding
     bool embedding         = false; // get only sentence embedding

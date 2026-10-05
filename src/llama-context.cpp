@@ -2429,7 +2429,8 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
     } else {
         res = std::max<uint32_t>(1024u, 8u*model.n_tensors());
         for (const auto & lora : model.loras) {
-            res += lora->get_n_nodes();
+            // training also adds the backward pass and the optimizer step of every adapter matmul
+            res += lora->get_n_nodes() * (training_graph ? 5u : 1u);
         }
     }
 
@@ -3556,6 +3557,8 @@ void llama_context::opt_init(struct llama_model * model, struct llama_opt_params
     }
 
     // the training graph is different, need to reserve again
+    // (it also holds the backward pass and the optimizer step, see graph_max_nodes)
+    training_graph = true;
     sched_need_reserve = true;
     sched_reserve();
 
@@ -3588,6 +3591,14 @@ void llama_context::opt_init(struct llama_model * model, struct llama_opt_params
     for (struct llama_layer & layer : model->layers) {
         for (size_t i = 0; i < sizeof(layer)/sizeof(struct ggml_tensor *); ++i) {
             llama_set_param(reinterpret_cast<struct ggml_tensor **>(&layer)[i], param_filter, param_filter_ud);
+        }
+    }
+
+    // the LoRA adapters set on this context, e.g. from llama_adapter_lora_init_trainable
+    for (const auto & it : *loras) {
+        for (const auto & ab : it.first->ab_map) {
+            llama_set_param(ab.second.a, param_filter, param_filter_ud);
+            llama_set_param(ab.second.b, param_filter, param_filter_ud);
         }
     }
 }
@@ -4463,6 +4474,12 @@ bool llama_opt_param_filter_all(const struct ggml_tensor * tensor, void * userda
     GGML_UNUSED(tensor);
     GGML_UNUSED(userdata);
     return true;
+}
+
+bool llama_opt_param_filter_lora(const struct ggml_tensor * tensor, void * userdata) {
+    GGML_UNUSED(userdata);
+    const size_t n = strlen(tensor->name);
+    return n > 7 && (strcmp(tensor->name + n - 7, ".lora_a") == 0 || strcmp(tensor->name + n - 7, ".lora_b") == 0);
 }
 
 void llama_opt_init(struct llama_context * ctx, struct llama_model * model, struct llama_opt_params lopt_params) {

@@ -294,6 +294,8 @@ private:
     llama_adapter_cvec_ptr  cvec;
     llama_adapter_loras_ptr loras;
 
+    bool training_graph = false; // set by opt_init: graphs also hold the backward pass and the optimizer step
+
     llama_cross cross; // TODO: tmp for handling cross-attention - need something better probably
 
     llama_memory_ptr memory;
