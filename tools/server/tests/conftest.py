@@ -30,6 +30,9 @@ def load_server_presets(configure_worker_port, tmp_path_factory):
     # this will be run once per test session, before any tests
 
     # serialize model downloads across parallel workers.
+    # LLAMA_TEST_NO_DOWNLOAD=1: skip it, for builds without HTTPS (tests then use local model files)
+    if os.environ.get("LLAMA_TEST_NO_DOWNLOAD"):
+        return
     root_tmp_dir = tmp_path_factory.getbasetemp().parent
     with FileLock(str(root_tmp_dir / "load_all.lock")):
         ServerPreset.load_all()

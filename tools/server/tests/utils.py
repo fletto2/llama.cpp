@@ -118,6 +118,7 @@ class ServerProcess:
     ui_mcp_proxy: bool = False
     backend_sampling: bool = False
     gcp_compat: bool = False
+    extra_args: List[str] | None = None  # appended to the server command line as given
     server_tools: str | None = None
     server_tools_runtime: str | None = None
     mcp_servers_config: str | None = None
@@ -294,6 +295,8 @@ class ServerProcess:
         if self.gcp_compat:
             env["AIP_MODE"] = "PREDICTION"
             env["AIP_HTTP_PORT"] = str(self.server_port)
+        if self.extra_args:
+            server_args.extend(self.extra_args)
 
         args = [str(arg) for arg in [server_path, *server_args]]
         print(f"tests: starting server with: {' '.join(args)}")
