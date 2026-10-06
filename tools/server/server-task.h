@@ -1,6 +1,7 @@
 #pragma once
 
 #include "common.h"
+#include "classifier.h"
 #include "llama.h"
 
 #include <string>
@@ -29,6 +30,9 @@ enum server_task_type {
     SERVER_TASK_TYPE_GET_LORA,
     SERVER_TASK_TYPE_SET_LORA,
     SERVER_TASK_TYPE_CLASSIFY,          // classifier heads on the loaded model
+    SERVER_TASK_TYPE_FEATURES,          // pooled hidden states of chosen layers
+    SERVER_TASK_TYPE_FEATURES_RAW,      // the same as float arrays (classifier training)
+    SERVER_TASK_TYPE_CLASSIFY_ADD_HEAD, // register a trained head
     SERVER_TASK_TYPE_LORA_TRAIN,        // start a LoRA training job
     SERVER_TASK_TYPE_LORA_TRAIN_STATUS, // list the training jobs
     SERVER_TASK_TYPE_LORA_TRAIN_CANCEL,
@@ -208,9 +212,17 @@ struct server_task {
     // used by SERVER_TASK_TYPE_SET_LORA
     std::map<int, float> set_lora; // mapping adapter ID -> scale
 
-    // used by SERVER_TASK_TYPE_CLASSIFY (the input) and SERVER_TASK_TYPE_LORA_TRAIN* (the request body)
+    // used by SERVER_TASK_TYPE_CLASSIFY / FEATURES (the input) and SERVER_TASK_TYPE_LORA_TRAIN* (the request body)
     llama_tokens tokens_classify;
     json         lora_train;
+
+    // used by SERVER_TASK_TYPE_FEATURES*: layers (1..n_layer; FEATURES_RAW: empty = the automatic
+    // candidates) and pooling names (mean, last)
+    std::vector<int32_t>     feature_layers;
+    std::vector<std::string> feature_poolings;
+
+    // used by SERVER_TASK_TYPE_CLASSIFY_ADD_HEAD
+    std::shared_ptr<common_classifier_head> classifier_head;
 
     server_task() = default;
 
@@ -602,6 +614,15 @@ struct server_task_result_json : server_task_result {
     json data;
     virtual json to_json() override {
         return data;
+    }
+};
+
+// pooled features of one input: layers x poolings x n_embd floats (SERVER_TASK_TYPE_FEATURES_RAW)
+struct server_task_result_features : server_task_result {
+    std::vector<int32_t> layers;
+    std::vector<float>   data;
+    virtual json to_json() override {
+        return json {{"layers", layers}, {"n_floats", data.size()}};
     }
 };
 

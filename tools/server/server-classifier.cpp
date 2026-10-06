@@ -2,179 +2,97 @@
 
 #include "../../src/llama-ext.h" // staging API: llama_set_n_layer_exit
 
-#include "ggml.h"
-#include "ggml-backend.h"
-#include "gguf.h"
-
-#include <cmath>
-#include <cstring>
+#include <algorithm>
 #include <stdexcept>
 
-// one early-exit context and the mean of the residual after its last layer
+// one early-exit context and the capture of its tapped layers
 struct server_classifier_ctx {
-    int32_t         layer = 0;
-    std::string     tap_name; // l_out-<layer-1>
-    llama_context * ctx   = nullptr;
-
-    std::vector<double> sum;
-    std::vector<float>  buf;
-    int64_t             rows = 0;
-    std::string         error; // set by the callback (exceptions must not cross the ggml C code)
+    llama_context *           ctx = nullptr;
+    common_classifier_capture cap;
 
     ~server_classifier_ctx() {
         llama_free(ctx);
-    }
-
-    static bool cb_eval(ggml_tensor * t, bool ask, void * user_data) {
-        auto * self = (server_classifier_ctx *) user_data;
-        if (ask) {
-            return self->tap_name == t->name;
-        }
-        if (self->tap_name != t->name) {
-            return true;
-        }
-        const int64_t n_embd = (int64_t) self->sum.size();
-        if (t->type != GGML_TYPE_F32 || t->ne[0] != n_embd || !ggml_is_contiguous(t)) {
-            self->error = std::string("classifier: unexpected layout of ") + t->name;
-            return false; // stop the graph
-        }
-        const int64_t n_rows = ggml_nelements(t) / n_embd;
-        try {
-            self->buf.resize(ggml_nelements(t));
-        } catch (const std::exception & e) {
-            self->error = std::string("classifier: ") + e.what();
-            return false;
-        }
-        ggml_backend_tensor_get(t, self->buf.data(), 0, ggml_nbytes(t));
-        for (int64_t r = 0; r < n_rows; r++) {
-            const float * row = self->buf.data() + r*n_embd;
-            for (int64_t i = 0; i < n_embd; i++) {
-                self->sum[i] += row[i];
-            }
-        }
-        self->rows += n_rows;
-        return true;
     }
 };
 
 server_classifier::server_classifier()  = default;
 server_classifier::~server_classifier() = default;
 
-static server_classifier_head load_head(const std::string & path) {
-    ggml_context * ctx_data = nullptr;
-    gguf_init_params ip = {
-        /*.no_alloc =*/ false,
-        /*.ctx      =*/ &ctx_data,
-    };
-    gguf_context * ctx = gguf_init_from_file(path.c_str(), ip);
-    if (!ctx) {
-        throw std::runtime_error("classifier: cannot read " + path);
-    }
-    auto get_str = [&](const char * key, const char * def) -> std::string {
-        const int64_t id = gguf_find_key(ctx, key);
-        if (id < 0) {
-            return def;
-        }
-        if (gguf_get_kv_type(ctx, id) != GGUF_TYPE_STRING) {
-            throw std::runtime_error(std::string(key) + " is not a string");
-        }
-        return gguf_get_val_str(ctx, id);
-    };
-
-    server_classifier_head head;
-    head.path = path;
-    try {
-        if (get_str("general.type", "") != "classifier") {
-            throw std::runtime_error("general.type is not 'classifier'");
-        }
-        const int64_t id_layer = gguf_find_key(ctx, "classifier.layer");
-        if (id_layer < 0) {
-            throw std::runtime_error("classifier.layer is missing");
-        }
-        switch (gguf_get_kv_type(ctx, id_layer)) {
-            case GGUF_TYPE_UINT32: head.layer = (int32_t) gguf_get_val_u32(ctx, id_layer); break;
-            case GGUF_TYPE_INT32:  head.layer =           gguf_get_val_i32(ctx, id_layer); break;
-            default: throw std::runtime_error("classifier.layer is not a 32-bit integer");
-        }
-        head.question_id = get_str("classifier.question_id", "relevant");
-        head.type        = get_str("classifier.type", "noul");
-        if (head.type != "noul") {
-            throw std::runtime_error("unsupported classifier.type '" + head.type + "'");
-        }
-        ggml_tensor * w = ggml_get_tensor(ctx_data, "classifier.weight");
-        ggml_tensor * b = ggml_get_tensor(ctx_data, "classifier.bias");
-        if (!w || !b || w->type != GGML_TYPE_F32 || b->type != GGML_TYPE_F32 || ggml_nelements(b) != 1) {
-            throw std::runtime_error("classifier.weight / classifier.bias (F32) are missing");
-        }
-        head.weight.assign((const float *) w->data, (const float *) w->data + ggml_nelements(w));
-        head.bias = *(const float *) b->data;
-    } catch (const std::exception & e) {
-        gguf_free(ctx);
-        ggml_free(ctx_data);
-        throw std::runtime_error("classifier: " + path + ": " + e.what());
-    }
-    gguf_free(ctx);
-    ggml_free(ctx_data);
-    return head;
+bool server_classifier::features_enabled() const {
+    return feat != nullptr;
 }
 
-void server_classifier::init(llama_model * model, const std::vector<std::string> & paths, int32_t n_ctx, int32_t n_threads) {
-    this->model   = model;
-    this->n_embd  = llama_model_n_embd(model);
-    this->n_ctx   = n_ctx;
-    this->n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
-    const int32_t n_layer = llama_model_n_layer(model);
+static std::unique_ptr<server_classifier_ctx> make_ctx(llama_model * model, int32_t n_ctx, int32_t n_threads,
+                                                       int32_t n_embd, const std::vector<int32_t> & layers, int32_t exit) {
+    auto c = std::make_unique<server_classifier_ctx>();
+    c->cap.set_layers(n_embd, layers);
+    llama_context_params cp = llama_context_default_params();
+    // embeddings mode: every token is an output, so the graph keeps all rows up to the exit layer
+    // (otherwise the rows of non-output tokens are dropped before the last computed layer) and no LM
+    // head is computed; pooling needs the whole input in one ubatch
+    cp.embeddings        = true;
+    cp.pooling_type      = LLAMA_POOLING_TYPE_MEAN;
+    cp.n_ctx             = n_ctx;
+    cp.n_batch           = n_ctx;
+    cp.n_ubatch          = n_ctx;
+    cp.n_seq_max         = 1;
+    cp.n_threads         = n_threads;
+    cp.n_threads_batch   = n_threads;
+    cp.cb_eval           = common_classifier_capture::cb_eval;
+    cp.cb_eval_user_data = &c->cap;
+    c->ctx = llama_init_from_model(model, cp);
+    if (!c->ctx) {
+        throw std::runtime_error("classifier: cannot create a context");
+    }
+    llama_set_n_layer_exit(c->ctx, exit);
+    return c;
+}
+
+void server_classifier::init(llama_model * model, const std::vector<std::string> & paths, int32_t n_ctx, int32_t n_threads, bool features) {
+    this->model    = model;
+    this->n_embd   = llama_model_n_embd(model);
+    this->n_ctx    = n_ctx;
+    this->n_vocab  = llama_vocab_n_tokens(llama_model_get_vocab(model));
+    this->n_layer_ = llama_model_n_layer(model);
+    this->n_threads = n_threads;
 
     for (const auto & path : paths) {
-        server_classifier_head head = load_head(path);
-        if ((int32_t) head.weight.size() != n_embd) {
-            throw std::runtime_error("classifier: " + path + ": weight has " + std::to_string(head.weight.size()) +
-                                     " values, the model has n_embd = " + std::to_string(n_embd));
+        common_classifier_head head;
+        std::string err;
+        if (!common_classifier_head_load(path, head, err)) {
+            throw std::runtime_error("classifier: " + err);
         }
-        if (head.layer < 1 || head.layer > n_layer) {
+        if (head.n_embd != n_embd) {
+            throw std::runtime_error("classifier: " + path + ": the head is for n_embd = " + std::to_string(head.n_embd) +
+                                     ", the model has n_embd = " + std::to_string(n_embd));
+        }
+        if (head.layer < 1 || head.layer > n_layer_) {
             throw std::runtime_error("classifier: " + path + ": layer " + std::to_string(head.layer) +
-                                     " is outside 1.." + std::to_string(n_layer));
+                                     " is outside 1.." + std::to_string(n_layer_));
+        }
+        for (const auto & other : heads) {
+            if (other.question_id == head.question_id) {
+                throw std::runtime_error("classifier: " + path + ": question_id '" + head.question_id + "' is already used by " + other.path);
+            }
         }
         heads.push_back(std::move(head));
     }
 
+    std::vector<int32_t> layers;
     for (const auto & head : heads) {
-        bool have = false;
-        for (const auto & c : ctxs) {
-            have |= c->layer == head.layer;
+        if (std::find(layers.begin(), layers.end(), head.layer) == layers.end()) {
+            layers.push_back(head.layer);
         }
-        if (have) {
-            continue;
-        }
-        auto c = std::make_unique<server_classifier_ctx>();
-        c->layer    = head.layer;
-        c->tap_name = "l_out-" + std::to_string(head.layer - 1);
-        c->sum.assign(n_embd, 0.0);
-
-        llama_context_params cp = llama_context_default_params();
-        // embeddings mode: every token is an output, so the graph keeps all rows up to the exit layer
-        // (otherwise the rows of non-output tokens are dropped before the last computed layer) and no LM
-        // head is computed; pooling needs the whole input in one ubatch
-        cp.embeddings        = true;
-        cp.pooling_type      = LLAMA_POOLING_TYPE_MEAN;
-        cp.n_ctx             = n_ctx;
-        cp.n_batch           = n_ctx;
-        cp.n_ubatch          = n_ctx;
-        cp.n_seq_max         = 1;
-        cp.n_threads         = n_threads;
-        cp.n_threads_batch   = n_threads;
-        cp.cb_eval           = server_classifier_ctx::cb_eval;
-        cp.cb_eval_user_data = c.get();
-        c->ctx = llama_init_from_model(model, cp);
-        if (!c->ctx) {
-            throw std::runtime_error("classifier: cannot create a context for layer " + std::to_string(head.layer));
-        }
-        llama_set_n_layer_exit(c->ctx, head.layer);
-        ctxs.push_back(std::move(c));
+    }
+    for (int32_t L : layers) {
+        ctxs.push_back(make_ctx(model, n_ctx, n_threads, n_embd, {L}, L));
+    }
+    if (features) {
+        feat = make_ctx(model, n_ctx, n_threads, n_embd, {}, 0);
     }
 }
 
-json server_classifier::classify(const llama_tokens & tokens) {
+void server_classifier::check_tokens(const llama_tokens & tokens) const {
     if (tokens.empty()) {
         throw std::invalid_argument("classifier: empty input");
     }
@@ -187,54 +105,164 @@ json server_classifier::classify(const llama_tokens & tokens) {
             throw std::invalid_argument("classifier: token id " + std::to_string(t) + " is outside the vocabulary");
         }
     }
+}
+
+void server_classifier::decode(server_classifier_ctx & c, const llama_tokens & tokens) {
+    c.cap.reset();
+    llama_memory_clear(llama_get_memory(c.ctx), true);
+    llama_tokens ids = tokens;
+    const int32_t ret = llama_decode(c.ctx, llama_batch_get_one(ids.data(), (int32_t) ids.size()));
+    if (!c.cap.error.empty()) {
+        throw std::runtime_error(c.cap.error);
+    }
+    if (ret != 0) {
+        throw std::runtime_error("classifier: decode failed");
+    }
+    llama_synchronize(c.ctx);
+    for (size_t i = 0; i < c.cap.layers.size(); i++) {
+        if (c.cap.rows[i] != (int64_t) tokens.size()) {
+            throw std::runtime_error("classifier: read " + std::to_string(c.cap.rows[i]) + " rows of layer " +
+                                     std::to_string(c.cap.layers[i]) + " for " + std::to_string(tokens.size()) + " tokens");
+        }
+    }
+}
+
+json server_classifier_answer(const common_classifier_head & head, const std::vector<double> & p) {
+    switch (head.type) {
+        case COMMON_CLASSIFIER_NOUL:
+            return json {{"type", "noul"}, {"noul", p[1]}};
+        case COMMON_CLASSIFIER_CHOICE: {
+            const size_t best = std::max_element(p.begin(), p.end()) - p.begin();
+            json probs = json::object();
+            for (size_t k = 0; k < p.size(); k++) {
+                probs[head.options[k]] = p[k];
+            }
+            return json {{"type", "choice"}, {"choice", head.options[best]}, {"confidence", p[best]}, {"probabilities", probs}};
+        }
+        case COMMON_CLASSIFIER_SCORE: {
+            double expected = 0.0;
+            json probs  = json::object();
+            json legend = json::object();
+            for (size_t k = 0; k < p.size(); k++) {
+                expected += (double) k * p[k];
+                probs[std::to_string(k)]  = p[k];
+                legend[std::to_string(k)] = head.options[k];
+            }
+            return json {{"type", "score"}, {"score", expected}, {"confidence", *std::max_element(p.begin(), p.end())},
+                         {"legend", legend}, {"probabilities", probs}};
+        }
+    }
+    return json();
+}
+
+json server_classifier::classify(const llama_tokens & tokens) {
+    check_tokens(tokens);
     json answers = json::object();
+    std::vector<float> x;
     for (auto & c : ctxs) {
-        std::fill(c->sum.begin(), c->sum.end(), 0.0);
-        c->rows = 0;
-        c->error.clear();
-        llama_memory_clear(llama_get_memory(c->ctx), true);
-
-        llama_tokens ids = tokens;
-        const int32_t ret = llama_decode(c->ctx, llama_batch_get_one(ids.data(), (int32_t) ids.size()));
-        if (!c->error.empty()) {
-            throw std::runtime_error(c->error);
-        }
-        if (ret != 0) {
-            throw std::runtime_error("classifier: decode failed");
-        }
-        llama_synchronize(c->ctx);
-        if (c->rows != (int64_t) tokens.size()) {
-            throw std::runtime_error("classifier: read " + std::to_string(c->rows) + " rows for " +
-                                     std::to_string(tokens.size()) + " tokens");
-        }
-
+        decode(*c, tokens);
         for (const auto & head : heads) {
-            if (head.layer != c->layer) {
+            if (head.layer != c->cap.layers[0]) {
                 continue;
             }
-            double z = head.bias;
-            for (int32_t i = 0; i < n_embd; i++) {
-                z += head.weight[i] * (c->sum[i] / (double) c->rows);
-            }
-            const double p = 1.0 / (1.0 + std::exp(-z));
-            answers[head.question_id] = json {
-                {"type", head.type},
-                {head.type, p},
-            };
+            c->cap.get(head.layer, head.pooling, x);
+            answers[head.question_id] = server_classifier_answer(head, common_classifier_probs(head, x.data()));
         }
     }
     return answers;
 }
 
+std::vector<float> server_classifier::features_raw(const llama_tokens & tokens, const std::vector<int32_t> & layers,
+                                                  const std::vector<common_classifier_pooling> & poolings) {
+    if (!feat) {
+        throw std::invalid_argument("features are disabled, start the server with --features");
+    }
+    check_tokens(tokens);
+    if (layers.empty() || poolings.empty()) {
+        throw std::invalid_argument("features: no layers or poolings requested");
+    }
+    for (int32_t L : layers) {
+        if (L < 1 || L > n_layer_) {
+            throw std::invalid_argument("features: layer " + std::to_string(L) + " is outside 1.." + std::to_string(n_layer_));
+        }
+    }
+    feat->cap.set_layers(n_embd, layers);
+    // compute only as deep as the deepest requested layer (the memory is cleared for every input anyway)
+    llama_set_n_layer_exit(feat->ctx, *std::max_element(layers.begin(), layers.end()));
+    decode(*feat, tokens);
+    std::vector<float> out;
+    out.reserve(layers.size() * poolings.size() * n_embd);
+    std::vector<float> x;
+    for (int32_t L : layers) {
+        for (auto pool : poolings) {
+            feat->cap.get(L, pool, x);
+            out.insert(out.end(), x.begin(), x.end());
+        }
+    }
+    return out;
+}
+
+void server_classifier::add_head(const common_classifier_head & head) {
+    const std::string err = head.validate();
+    if (!err.empty()) {
+        throw std::invalid_argument("classifier: " + err);
+    }
+    if (head.n_embd != n_embd || head.layer < 1 || head.layer > n_layer_) {
+        throw std::invalid_argument("classifier: the head does not fit the model");
+    }
+    bool have_ctx = false;
+    for (const auto & c : ctxs) {
+        have_ctx = have_ctx || c->cap.layers[0] == head.layer;
+    }
+    if (!have_ctx) {
+        ctxs.push_back(make_ctx(model, n_ctx, n_threads, n_embd, {head.layer}, head.layer));
+    }
+    bool replaced = false;
+    for (auto & h : heads) {
+        if (h.question_id == head.question_id) {
+            h = head;
+            replaced = true;
+        }
+    }
+    if (!replaced) {
+        heads.push_back(head);
+    }
+    // a replaced head may have left its old layer without heads
+    ctxs.erase(std::remove_if(ctxs.begin(), ctxs.end(), [&](const std::unique_ptr<server_classifier_ctx> & c) {
+        return std::none_of(heads.begin(), heads.end(), [&](const common_classifier_head & h) { return h.layer == c->cap.layers[0]; });
+    }), ctxs.end());
+}
+
+json server_classifier::features(const llama_tokens & tokens, const std::vector<int32_t> & layers,
+                                 const std::vector<common_classifier_pooling> & poolings) {
+    const std::vector<float> raw = features_raw(tokens, layers, poolings);
+    json out = json::object();
+    size_t off = 0;
+    for (int32_t L : layers) {
+        json per = json::object();
+        for (auto pool : poolings) {
+            per[common_classifier_pooling_name(pool)] = std::vector<float>(raw.begin() + off, raw.begin() + off + n_embd);
+            off += n_embd;
+        }
+        out[std::to_string(L)] = per;
+    }
+    return out;
+}
+
 json server_classifier::info() const {
     json out = json::array();
     for (const auto & head : heads) {
-        out.push_back({
+        json h = {
             {"path",        head.path},
             {"question_id", head.question_id},
-            {"type",        head.type},
+            {"type",        common_classifier_type_name(head.type)},
+            {"pooling",     common_classifier_pooling_name(head.pooling)},
             {"layer",       head.layer},
-        });
+        };
+        if (!head.options.empty()) {
+            h["options"] = head.options;
+        }
+        out.push_back(h);
     }
     return out;
 }

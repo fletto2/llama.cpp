@@ -533,6 +533,9 @@ struct common_params {
 
     std::vector<std::string> classifier_heads; // GGUF classifier heads (server: POST /classify)
     int32_t classifier_n_ctx = 4096;           // max tokens per classified input
+    bool    classifier_features = false;       // server: POST /features (pooled hidden states)
+    bool    classifier_train    = false;       // server: POST /classify/train (implies classifier_features)
+    std::string classifier_dir;                // server: where POST /classify/train saves heads ("save": true)
     bool lora_train = false;                   // server: enable POST /lora/train (LoRA training on the loaded model)
     std::string lora_train_dir = "";           // server: where trained adapters are written (default: <temp>/llama-lora-train)
     int32_t lora_train_max_steps  = 10000;     // server: per-job limits of POST /lora/train (optimizer steps,

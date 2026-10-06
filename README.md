@@ -4,7 +4,8 @@ This is [llama.cpp](https://github.com/ggml-org/llama.cpp) plus a few small patc
 
 - **Per-context early exit:** a classifier and text generation can share one loaded model.
 - **LoRA training:** train a LoRA adapter in C/C++ on a frozen base model, including a quantized one, on CPU or GPU, and save it as a GGUF adapter that `--lora` loads.
-- **llama-server:** classifier heads (`--classifier`, `POST /classify`) and LoRA training on the loaded model between requests (`--lora-train`, `POST /lora/train`).
+- **Classifier heads** on the hidden states of the loaded model: yes/no (`noul`), multiple-choice (`choice`) and ordinal (`score`) questions. `llama-classifier` extracts features and trains heads. llama-server answers with them (`POST /classify`), returns pooled hidden states (`POST /features`) and trains new heads live (`POST /classify/train`).
+- **llama-server LoRA training** on the loaded model between requests (`--lora-train`, `POST /lora/train`).
 
 Everything else is unchanged upstream code. For building, models, tools and the full documentation, see the [official llama.cpp README](https://github.com/ggml-org/llama.cpp/blob/master/README.md).
 
@@ -27,10 +28,48 @@ To use it as a classifier:
 
 1. Load the model once and create both contexts from it.
 2. Read the residual after layer `L-1` (graph tensor `l_out-<L-1>`) with an eval callback (`cb_eval`), and mean-pool it over the item's tokens. You can also set `pooling_type = LLAMA_POOLING_TYPE_MEAN` and read the pooled embedding. That output passes through `output_norm`, so it is the normalised version of the same feature.
-3. Train a linear head, e.g. logistic regression, on those features: `p = sigmoid(w·x + b)`.
+3. Train a linear head on those features (`llama-classifier`, below).
 4. At run time, send items to the classifier context. The generation context's prompt prefill passes through the same layer, so a program using the C API can also classify a generation request from its own prefill at no extra cost. (llama-server's `/classify` always runs the input through the classifier context.)
 
-The middle layers usually make the best classifier features. Pick `L` by cross-validation on your own data.
+The middle layers usually make the best classifier features. Pick `L` by cross-validation on your own data; `llama-classifier train` does that.
+
+`common/classifier.h` holds the shared parts: the head file, the feature capture through `cb_eval`, and the fitting code.
+
+## Classifier heads
+
+A head reads the residual after `L` layers, pooled over the input (`mean`, or the `last` token), and answers one question:
+
+| type | model | answer |
+|---|---|---|
+| `noul` | logistic regression, `p = sigmoid(w·x + b)` | `{"type": "noul", "noul": 0.97}` |
+| `choice` | softmax over K options, `softmax(W x + b)` | `{"type": "choice", "choice": "b", "confidence": 0.8, "probabilities": {"a": 0.1, "b": 0.8, "c": 0.1}}` |
+| `score` | proportional odds over K ordered levels, `P(y ≤ k) = sigmoid(θ_k − w·x)` | `{"type": "score", "score": 2.4, "confidence": 0.6, "legend": {"0": "none", ...}, "probabilities": {"0": 0.02, ...}}` |
+
+`score` is the expected level, `Σ k·p_k`. `confidence` is the probability of the most likely option or level.
+
+**Head file** (GGUF, `general.type = classifier`):
+- `classifier.layer` (u32): L
+- `classifier.question_id` (str)
+- `classifier.type`: `noul` | `choice` | `score` (default `noul`)
+- `classifier.pooling`: `mean` | `last` (default `mean`)
+- `classifier.options` ([str]): the option ids (`choice`) or level descriptions (`score`)
+- `classifier.weight` F32 [n_embd, n_out] (n_out = K for `choice`, else 1)
+- `classifier.bias` F32: [1] (`noul`), [K] (`choice`) or the K−1 non-decreasing thresholds θ (`score`)
+- `classifier.info.*` (str): training settings and cross-validated metrics, written by the trainers
+
+**Training** minimises the mean log-loss plus `‖w‖² / (2·C·n)`, on standardised features, with L-BFGS. That is the same objective as scikit-learn's `LogisticRegression(C)`; the stored weights are for raw features. On a 579-item, 4096-dimensional set it matches scikit-learn's probabilities within 2e-4, for `noul` and for `choice` (multinomial). `--balanced` weights the classes by inverse frequency.
+
+```sh
+# data: one JSON object per line, {"text": "...", "label": ...} or {"tokens": [...], "label": ...}
+# labels: true/false (noul), an option id (choice), a level name or index 0..K-1 (score)
+llama-classifier train -m model.gguf --data train.jsonl --type choice --question-id topic --out topic.gguf \
+    [--options a,b,c] [--layers auto|L,L,..] [--pooling auto|mean|last] [--C 0.01,0.1,1] [--folds 5] [--balanced]
+llama-classifier eval     -m model.gguf --head topic.gguf --data test.jsonl [--predictions out.jsonl]
+llama-classifier features -m model.gguf --data data.jsonl --layers 12,18 --out feats    # raw f32 matrices + labels
+llama-classifier fit      --features feats.L18.mean.f32 --labels feats.labels.txt --layer 18 --type noul --out head.gguf
+```
+
+`train` extracts the features of every candidate layer and both poolings in one pass. It cross-validates every layer × pooling × C setting (stratified k-fold), picks the one with the lowest held-out log-loss, and refits it on all items. `--layers auto` tries about 12 layers spread over the depth.
 
 ## LoRA training
 
@@ -66,27 +105,37 @@ It also fixes two problems in upstream training code:
 ## llama-server
 
 ```sh
-llama-server -m model.gguf --classifier head.gguf [--classifier head2.gguf] --lora-train
+llama-server -m model.gguf --classifier head.gguf --lora-train
 ```
 
 ### Classifier
 
-**Head format.** A head is a small GGUF file with:
-- `general.type = classifier`
-- `classifier.layer` (u32): the exit layer L
-- `classifier.question_id`
-- `classifier.type = noul`
-- `classifier.weight` F32 [n_embd] and `classifier.bias` F32 [1]
+```sh
+llama-server -m model.gguf --classifier topic.gguf [--classifier h2.gguf] [--features] [--classifier-train [--classifier-dir DIR]]
+```
 
-The feature is the residual after layer L, mean-pooled over the input. Heads that read the same layer share one early-exit context on the loaded model.
+Heads that read the same layer share one early-exit context on the loaded model.
 
-**Memory:** each distinct layer costs one context of `--classifier-ctx` tokens (default 4096). Its KV cache covers all layers, because early exit doesn't shrink it, plus a compute buffer of that size. Lower `--classifier-ctx` when inputs are short.
+**Memory:** each distinct layer costs one context of `--classifier-ctx` tokens (default 4096), and so does `--features`. Its KV cache covers all layers, because early exit doesn't shrink it, plus a compute buffer of that size. Lower `--classifier-ctx` when inputs are short.
 
-**Request:** `POST /classify` with `{"input": "text"}`, a token array, or an array of either. The response:
+**`POST /classify`** with `{"input": "text"}`, a token array, or an array of either. One answer per head:
 
 ```json
-{"model": "...", "answers": {"<question_id>": {"type": "noul", "noul": 0.97}}, "usage": {"input_tokens": 35, "output_tokens": 0}}
+{"model": "...", "answers": {"relevant": {"type": "noul", "noul": 0.97}, "topic": {"type": "choice", ...}}, "usage": {"input_tokens": 35, "output_tokens": 0}}
 ```
+
+**`POST /features`** (`--features`): pooled hidden states, for training heads elsewhere. The body: `input` as above, `layers` (a number or an array, 1..n_layer, default the last layer), `pooling` (`"mean"`, `"last"` or both, default both). The response: `{"model": ..., "n_tokens": 35, "features": {"18": {"mean": [...], "last": [...]}}}`. The context computes only up to the deepest requested layer.
+
+**`POST /classify/train`** (`--classifier-train`, which also turns on `--features`): fits a head on labelled inputs and adds it to `/classify` at once. A head with the same `question_id` is replaced. The body:
+- `question_id`: letters, digits, `_`, `-`, `.`
+- `type`: `noul` (default), `choice` or `score`; `options` as in `llama-classifier` (required for `score`)
+- `data`: `[{"input": text or tokens, "label": ...}, ...]`; inputs longer than `--classifier-ctx` are cut
+- `layers` (`"auto"` or numbers), `pooling` (`auto`, `mean`, `last`), `C` (a number or an array, default 0.01, 0.1, 1), `folds` (5), `seed`, `balanced`
+- `save`: write `<question_id>.gguf` to `--classifier-dir`
+
+The response has the chosen `layer`, `pooling` and `C`, the cross-validated metrics (`cv`: log-loss, accuracy, AUC for `noul`, MAE for `score`), one line per tried setting (`grid`), the saved path and the list of heads. The features are computed in the server loop one input at a time, so other requests are served in between; the cross-validation and the fit run on the HTTP thread. The result is identical to `llama-classifier train` on the same data and settings.
+
+These endpoints also work on a native decision model; its own decision endpoint gives the same answers with them turned on.
 
 ### LoRA training
 

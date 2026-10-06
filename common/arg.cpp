@@ -3824,6 +3824,28 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--features"},
+        "serve POST /features: mean- and last-token-pooled hidden states of chosen layers (inputs up to --classifier-ctx tokens)",
+        [](common_params & params) {
+            params.classifier_features = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--classifier-train"},
+        "serve POST /classify/train: fit a head on labelled inputs and register it live (enables --features)",
+        [](common_params & params) {
+            params.classifier_train    = true;
+            params.classifier_features = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--classifier-dir"}, "DIR",
+        "directory where POST /classify/train saves heads that are requested with \"save\": true (<question_id>.gguf)",
+        [](common_params & params, const std::string & value) {
+            params.classifier_dir = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--lora-train"},
         "enable POST /lora/train: train LoRA adapters on the loaded model between requests (default: disabled)",
         [](common_params & params) {

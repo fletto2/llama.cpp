@@ -1,30 +1,20 @@
 #pragma once
 
-// Classifier heads that share the loaded model with generation (llama_set_n_layer_exit).
+// Classifier heads that share the loaded model with generation (llama_set_n_layer_exit), and pooled
+// hidden-state features (POST /features).
 //
-// A head is a small GGUF file (general.type = "classifier"):
-//   classifier.layer        u32  the feature is the residual after this many layers (graph tensor l_out-<layer-1>),
-//                                mean-pooled over the input tokens
-//   classifier.question_id  str  key of the answer in the response
-//   classifier.type         str  "noul" (yes/no probability)
-//   classifier.weight       F32 [n_embd], classifier.bias F32 [1]: p = sigmoid(weight . feature + bias)
-// Heads that read the same layer share one early-exit context.
+// Heads (--classifier head.gguf, format in common/classifier.h) answer noul, choice and score questions
+// from the residual after `layer` layers, mean- or last-token-pooled. Heads that read the same layer share
+// one early-exit context. With --features, one more context returns pooled residuals of any layers.
+// Heads are written by llama-classifier (tools/classifier) or trained live (POST /classify/train).
 
 #include "llama.h"
+#include "classifier.h"
 #include "server-common.h"
 
 #include <memory>
 #include <string>
 #include <vector>
-
-struct server_classifier_head {
-    std::string        path;
-    std::string        question_id;
-    std::string        type;
-    int32_t            layer = 0;
-    std::vector<float> weight;
-    float              bias  = 0.0f;
-};
 
 struct server_classifier_ctx;
 
@@ -32,22 +22,46 @@ struct server_classifier {
     server_classifier();
     ~server_classifier();
 
-    // load the heads and create one early-exit context per layer; throws on error
-    void init(llama_model * model, const std::vector<std::string> & paths, int32_t n_ctx, int32_t n_threads);
+    // load the heads and create one early-exit context per layer, plus the features context if asked for;
+    // throws on error
+    void init(llama_model * model, const std::vector<std::string> & paths, int32_t n_ctx, int32_t n_threads, bool features);
 
-    bool enabled() const { return !heads.empty(); }
+    bool enabled()          const { return !heads.empty(); }
+    bool features_enabled() const;
 
-    // typed-decision answers for one input: {"<question_id>": {"type": "noul", "noul": p}, ...}
+    // typed-decision answers for one input: {"<question_id>": {"type": ..., ...}, ...}
     json classify(const llama_tokens & tokens);
+
+    // pooled residuals: {"<layer>": {"mean": [...], "last": [...]}} for the requested layers and poolings
+    json features(const llama_tokens & tokens, const std::vector<int32_t> & layers,
+                  const std::vector<common_classifier_pooling> & poolings);
+
+    // the same as float arrays: layers x poolings x n_embd
+    std::vector<float> features_raw(const llama_tokens & tokens, const std::vector<int32_t> & layers,
+                                    const std::vector<common_classifier_pooling> & poolings);
+
+    // register a head (replaces a head with the same question_id); creates its layer's context if needed
+    void add_head(const common_classifier_head & head);
 
     json info() const;
 
-    std::vector<server_classifier_head> heads;
+    std::vector<common_classifier_head> heads;
+
+    int32_t n_layer() const { return n_layer_; }
 
 private:
-    llama_model * model = nullptr;
-    int32_t n_embd  = 0;
-    int32_t n_ctx   = 0; // requested maximum input length (the context itself is padded to a multiple of 256)
-    int32_t n_vocab = 0;
+    void check_tokens(const llama_tokens & tokens) const;
+    void decode(server_classifier_ctx & c, const llama_tokens & tokens);
+
+    llama_model * model    = nullptr;
+    int32_t       n_embd   = 0;
+    int32_t       n_ctx    = 0; // requested maximum input length (the context itself is padded to a multiple of 256)
+    int32_t       n_vocab  = 0;
+    int32_t       n_layer_ = 0;
+    int32_t       n_threads = 1;
     std::vector<std::unique_ptr<server_classifier_ctx>> ctxs;
+    std::unique_ptr<server_classifier_ctx>              feat; // --features
 };
+
+// the answer of one head in the typed-decision shape
+json server_classifier_answer(const common_classifier_head & head, const std::vector<double> & probs);

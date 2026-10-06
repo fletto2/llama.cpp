@@ -157,6 +157,8 @@ struct server_routes {
     server_http_context::handler_t get_lora_adapters;
     server_http_context::handler_t post_lora_adapters;
     server_http_context::handler_t post_classify;           // classifier heads (--classifier)
+    server_http_context::handler_t post_features;           // pooled hidden states (--features)
+    server_http_context::handler_t post_classify_train;     // head training (--classifier-train)
     server_http_context::handler_t post_lora_train;         // LoRA training on the loaded model (--lora-train)
     server_http_context::handler_t get_lora_train;
     server_http_context::handler_t post_lora_train_cancel;

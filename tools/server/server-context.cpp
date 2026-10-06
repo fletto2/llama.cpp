@@ -1237,11 +1237,13 @@ private:
 
         vocab = llama_model_get_vocab(model_tgt);
 
-        if (!params_base.classifier_heads.empty()) {
+        if (!params_base.classifier_heads.empty() || params_base.classifier_features) {
             try {
                 classifier = std::make_unique<server_classifier>();
-                classifier->init(model_tgt, params_base.classifier_heads, params_base.classifier_n_ctx, params_base.cpuparams_batch.n_threads);
-                SRV_INF("loaded %zu classifier head(s): %s\n", classifier->heads.size(), classifier->info().dump().c_str());
+                classifier->init(model_tgt, params_base.classifier_heads, params_base.classifier_n_ctx,
+                                 params_base.cpuparams_batch.n_threads, params_base.classifier_features);
+                SRV_INF("loaded %zu classifier head(s)%s: %s\n", classifier->heads.size(),
+                        params_base.classifier_features ? ", features enabled" : "", classifier->info().dump().c_str());
             } catch (const std::exception & e) {
                 SRV_ERR("failed to load the classifier heads: %s\n", e.what());
                 return false;
@@ -2964,7 +2966,7 @@ private:
                 } break;
             case SERVER_TASK_TYPE_CLASSIFY:
                 {
-                    if (!classifier) {
+                    if (!classifier || !classifier->enabled()) {
                         send_error(task.id, "no classifier heads are loaded, start the server with --classifier", ERROR_TYPE_NOT_SUPPORTED);
                         break;
                     }
@@ -2977,6 +2979,83 @@ private:
                             {"answers", classifier->classify(task.tokens_classify)},
                             {"usage",   {{"input_tokens", task.tokens_classify.size()}, {"output_tokens", 0}}},
                         };
+                        queue_results.send(std::move(res));
+                    } catch (const std::invalid_argument & e) {
+                        send_error(task.id, e.what(), ERROR_TYPE_INVALID_REQUEST);
+                    } catch (const std::exception & e) {
+                        send_error(task.id, e.what(), ERROR_TYPE_SERVER);
+                    }
+                } break;
+            case SERVER_TASK_TYPE_FEATURES:
+                {
+                    if (!classifier || !classifier->features_enabled()) {
+                        send_error(task.id, "features are disabled, start the server with --features", ERROR_TYPE_NOT_SUPPORTED);
+                        break;
+                    }
+                    try {
+                        std::vector<common_classifier_pooling> poolings;
+                        for (const auto & name : task.feature_poolings) {
+                            common_classifier_pooling pool;
+                            if (!common_classifier_pooling_from_name(name, pool)) {
+                                throw std::invalid_argument("unknown pooling '" + name + "' (mean, last)");
+                            }
+                            poolings.push_back(pool);
+                        }
+                        std::vector<int32_t> layers = task.feature_layers;
+                        if (layers.empty()) {
+                            layers.push_back(classifier->n_layer());
+                        }
+                        auto res = std::make_unique<server_task_result_json>();
+                        res->id    = task.id;
+                        res->index = task.index;
+                        res->data  = json {
+                            {"model",    model_name},
+                            {"n_tokens", task.tokens_classify.size()},
+                            {"features", classifier->features(task.tokens_classify, layers, poolings)},
+                        };
+                        queue_results.send(std::move(res));
+                    } catch (const std::invalid_argument & e) {
+                        send_error(task.id, e.what(), ERROR_TYPE_INVALID_REQUEST);
+                    } catch (const std::exception & e) {
+                        send_error(task.id, e.what(), ERROR_TYPE_SERVER);
+                    }
+                } break;
+            case SERVER_TASK_TYPE_FEATURES_RAW:
+                {
+                    if (!classifier || !classifier->features_enabled()) {
+                        send_error(task.id, "head training is disabled, start the server with --classifier-train", ERROR_TYPE_NOT_SUPPORTED);
+                        break;
+                    }
+                    try {
+                        std::vector<common_classifier_pooling> poolings;
+                        for (const auto & name : task.feature_poolings) {
+                            common_classifier_pooling pool;
+                            if (!common_classifier_pooling_from_name(name, pool)) {
+                                throw std::invalid_argument("unknown pooling '" + name + "' (mean, last)");
+                            }
+                            poolings.push_back(pool);
+                        }
+                        auto res = std::make_unique<server_task_result_features>();
+                        res->id     = task.id;
+                        res->index  = task.index;
+                        res->layers = task.feature_layers.empty() ? common_classifier_auto_layers(classifier->n_layer()) : task.feature_layers;
+                        res->data   = classifier->features_raw(task.tokens_classify, res->layers, poolings);
+                        queue_results.send(std::move(res));
+                    } catch (const std::invalid_argument & e) {
+                        send_error(task.id, e.what(), ERROR_TYPE_INVALID_REQUEST);
+                    } catch (const std::exception & e) {
+                        send_error(task.id, e.what(), ERROR_TYPE_SERVER);
+                    }
+                } break;
+            case SERVER_TASK_TYPE_CLASSIFY_ADD_HEAD:
+                {
+                    try {
+                        GGML_ASSERT(classifier && task.classifier_head);
+                        classifier->add_head(*task.classifier_head);
+                        SRV_INF("classifier head '%s' registered: %s\n", task.classifier_head->question_id.c_str(), classifier->info().dump().c_str());
+                        auto res = std::make_unique<server_task_result_json>();
+                        res->id   = task.id;
+                        res->data = classifier->info();
                         queue_results.send(std::move(res));
                     } catch (const std::invalid_argument & e) {
                         send_error(task.id, e.what(), ERROR_TYPE_INVALID_REQUEST);
@@ -5862,8 +5941,8 @@ void server_routes::init_routes() {
         return res;
     };
 
-    // input: a string, a token array, or an array of those; one typed-decision object per input
-    this->post_classify = [this](const server_http_req & req) {
+    // input: a string, a token array, or an array of those; one result object per input
+    auto input_tasks = [this](const server_http_req & req, server_task_type type) {
         auto res = create_response();
         const json body = json::parse(req.body);
         json input;
@@ -5875,13 +5954,30 @@ void server_routes::init_routes() {
             res->error(format_error_response("\"input\" must be provided", ERROR_TYPE_INVALID_REQUEST));
             return res;
         }
+        // /features: "layers" (a number or an array, default the last layer), "pooling" ("mean", "last" or both)
+        std::vector<int32_t>     layers;
+        std::vector<std::string> poolings;
+        if (type == SERVER_TASK_TYPE_FEATURES) {
+            const json jl = body.value("layers", json::array());
+            if (jl.is_number_integer()) {
+                layers.push_back(jl.get<int32_t>());
+            } else {
+                layers = jl.get<std::vector<int32_t>>();
+            }
+            const json jp = body.value("pooling", json::array({"mean", "last"}));
+            if (jp.is_string()) {
+                poolings.push_back(jp.get<std::string>());
+            } else {
+                poolings = jp.get<std::vector<std::string>>();
+            }
+        }
         const bool batched = input.is_array() && !json_is_array_and_contains_numbers(input);
         std::vector<llama_tokens> items;
         auto tokenize = [&](const json & p) -> llama_tokens {
             if (p.is_string()) {
                 const std::string text = p.get<std::string>();
                 if (text.empty()) {
-                    return llama_tokens(); // rejected below; otherwise the BOS token alone would be classified
+                    return llama_tokens(); // rejected below; otherwise the BOS token alone would be processed
                 }
                 return common_tokenize(ctx_server.vocab, text, true, true);
             }
@@ -5904,10 +6000,13 @@ void server_routes::init_routes() {
         auto & rd = res->rd;
         {
             std::vector<server_task> tasks;
-            for (auto & it : items) {
-                server_task task(SERVER_TASK_TYPE_CLASSIFY);
-                task.id = rd.get_new_id();
-                task.tokens_classify = std::move(it);
+            for (size_t i = 0; i < items.size(); i++) {
+                server_task task(type);
+                task.id               = rd.get_new_id();
+                task.index            = i;
+                task.tokens_classify  = std::move(items[i]);
+                task.feature_layers   = layers;
+                task.feature_poolings = poolings;
                 tasks.push_back(std::move(task));
             }
             rd.post_tasks(std::move(tasks));
@@ -5924,6 +6023,266 @@ void server_routes::init_routes() {
             out.push_back(r->to_json());
         }
         res->ok(batched ? out : out.at(0));
+        return res;
+    };
+
+    // one typed-decision object per input (the answers of every head)
+    this->post_classify = [input_tasks](const server_http_req & req) {
+        return input_tasks(req, SERVER_TASK_TYPE_CLASSIFY);
+    };
+
+    // pooled hidden states per input
+    this->post_features = [input_tasks](const server_http_req & req) {
+        return input_tasks(req, SERVER_TASK_TYPE_FEATURES);
+    };
+
+    // fit a head on labelled inputs and register it: {"question_id", "type", "options", "data": [{"input", "label"}],
+    // "layers": "auto" | L | [L, ..], "pooling": "auto" | "mean" | "last", "C": c | [c, ..], "folds", "seed",
+    // "balanced", "save"}. The features come from the server loop one input at a time (other requests are
+    // served in between); the cross-validation and the fit run on this HTTP thread.
+    this->post_classify_train = [this](const server_http_req & req) {
+        auto res = create_response();
+        auto bad = [&](const std::string & msg) {
+            res->error(format_error_response(msg, ERROR_TYPE_INVALID_REQUEST));
+            return std::move(res);
+        };
+        if (!params.classifier_train) {
+            res->error(format_error_response("head training is disabled, start the server with --classifier-train", ERROR_TYPE_NOT_SUPPORTED));
+            return res;
+        }
+        const json body = json::parse(req.body);
+
+        common_classifier_head head;
+        head.question_id = body.value("question_id", std::string());
+        if (head.question_id.empty()) {
+            return bad("\"question_id\" must be provided");
+        }
+        for (const char c : head.question_id) {
+            if (!(std::isalnum((unsigned char) c) || c == '_' || c == '-' || c == '.')) {
+                return bad("\"question_id\" may only contain letters, digits, '_', '-' and '.'");
+            }
+        }
+        if (!common_classifier_type_from_name(body.value("type", std::string("noul")), head.type)) {
+            return bad("\"type\" must be noul, choice or score");
+        }
+        if (body.contains("options")) {
+            head.options = body.at("options").get<std::vector<std::string>>();
+        }
+        if (!body.contains("data") || !body.at("data").is_array() || body.at("data").empty()) {
+            return bad("\"data\" must be a non-empty array of {\"input\", \"label\"}");
+        }
+
+        std::vector<llama_tokens> items;
+        std::vector<std::string>  labels;
+        int64_t n_truncated = 0;
+        for (const auto & d : body.at("data")) {
+            if (!d.is_object() || !d.contains("input") || !d.contains("label")) {
+                return bad("every \"data\" item needs \"input\" and \"label\"");
+            }
+            const json & in = d.at("input");
+            llama_tokens t;
+            if (in.is_string()) {
+                const std::string text = in.get<std::string>();
+                if (!text.empty()) {
+                    t = common_tokenize(ctx_server.vocab, text, true, true);
+                }
+            } else {
+                t = in.get<llama_tokens>();
+            }
+            if (t.empty()) {
+                return bad("an input is empty");
+            }
+            if ((int32_t) t.size() > params.classifier_n_ctx) {
+                t.resize(params.classifier_n_ctx);
+                n_truncated++;
+            }
+            items.push_back(std::move(t));
+            const json & l = d.at("label");
+            labels.push_back(l.is_string() ? l.get<std::string>() : l.dump());
+        }
+        std::vector<int32_t> y;
+        std::string err;
+        if (!common_classifier_encode_labels(labels, head.type, head.options, y, err)) {
+            return bad(err);
+        }
+
+        std::vector<int32_t> layers; // empty = automatic candidates, chosen in the server loop
+        if (body.contains("layers") && !(body.at("layers").is_string() && body.at("layers").get<std::string>() == "auto")) {
+            const json & jl = body.at("layers");
+            if (jl.is_number_integer()) {
+                layers.push_back(jl.get<int32_t>());
+            } else {
+                layers = jl.get<std::vector<int32_t>>();
+            }
+            if (layers.empty()) {
+                return bad("\"layers\" is empty");
+            }
+        }
+        const std::string pooling = body.value("pooling", std::string("auto"));
+        std::vector<std::string> pool_names;
+        if (pooling == "auto" || pooling == "mean") pool_names.push_back("mean");
+        if (pooling == "auto" || pooling == "last") pool_names.push_back("last");
+        if (pool_names.empty()) {
+            return bad("\"pooling\" must be auto, mean or last");
+        }
+        std::vector<common_classifier_pooling> pools;
+        for (const auto & name : pool_names) {
+            common_classifier_pooling p;
+            common_classifier_pooling_from_name(name, p);
+            pools.push_back(p);
+        }
+
+        common_classifier_train_params tp;
+        tp.fit.type      = head.type;
+        tp.fit.n_classes = head.type == COMMON_CLASSIFIER_NOUL ? 2 : (int32_t) head.options.size();
+        tp.fit.balanced  = body.value("balanced", false);
+        tp.fit.n_threads = params.cpuparams_batch.n_threads > 0 ? params.cpuparams_batch.n_threads : 4;
+        tp.folds         = body.value("folds", 5);
+        tp.seed          = body.value("seed", 42);
+        if (body.contains("C")) {
+            const json & jc = body.at("C");
+            tp.Cs.clear();
+            if (jc.is_number()) {
+                tp.Cs.push_back(jc.get<double>());
+            } else {
+                for (const auto & c : jc) {
+                    tp.Cs.push_back(c.get<double>());
+                }
+            }
+            for (double C : tp.Cs) {
+                if (!(C > 0.0)) {
+                    return bad("every C must be positive");
+                }
+            }
+        }
+        const bool save = body.value("save", false);
+        if (save && params.classifier_dir.empty()) {
+            return bad("\"save\" needs the server option --classifier-dir");
+        }
+        {
+            std::vector<int64_t> count(tp.fit.n_classes, 0);
+            for (int32_t v : y) count[v]++;
+            for (int32_t k = 0; k < tp.fit.n_classes; k++) {
+                if (count[k] < tp.folds) {
+                    return bad("class " + std::to_string(k) + " has " + std::to_string(count[k]) + " items, fewer than the " +
+                               std::to_string(tp.folds) + " folds");
+                }
+            }
+        }
+
+        // features of every item
+        auto & rd = res->rd;
+        {
+            std::vector<server_task> tasks;
+            for (size_t i = 0; i < items.size(); i++) {
+                server_task task(SERVER_TASK_TYPE_FEATURES_RAW);
+                task.id               = rd.get_new_id();
+                task.index            = i;
+                task.tokens_classify  = std::move(items[i]);
+                task.feature_layers   = layers;
+                task.feature_poolings = pool_names;
+                tasks.push_back(std::move(task));
+            }
+            rd.post_tasks(std::move(tasks));
+        }
+        auto all_results = rd.wait_for_all(req.should_stop);
+        if (all_results.is_terminated) {
+            return res;
+        } else if (all_results.error) {
+            res->error(all_results.error->to_json());
+            return res;
+        }
+        const int64_t n = (int64_t) all_results.results.size();
+        auto * first = dynamic_cast<server_task_result_features *>(all_results.results[0].get());
+        GGML_ASSERT(first != nullptr);
+        layers = first->layers;
+        const size_t nl = layers.size(), np = pools.size();
+        const int32_t d = (int32_t) (first->data.size() / (nl * np));
+        std::vector<std::vector<std::vector<float>>> feats(nl, std::vector<std::vector<float>>(np));
+        for (auto & f : feats) for (auto & v : f) v.reserve((size_t) n * d);
+        for (auto & r : all_results.results) {
+            auto * fr = dynamic_cast<server_task_result_features *>(r.get());
+            GGML_ASSERT(fr != nullptr && fr->data.size() == nl * np * (size_t) d);
+            for (size_t l = 0; l < nl; l++) {
+                for (size_t p = 0; p < np; p++) {
+                    const float * src = fr->data.data() + (l * np + p) * d;
+                    feats[l][p].insert(feats[l][p].end(), src, src + d);
+                }
+            }
+            fr->data.clear();
+            fr->data.shrink_to_fit();
+        }
+
+        common_classifier_train_result tr;
+        if (!common_classifier_train(feats, n, d, layers, pools, y, tp, tr, err)) {
+            return bad(err);
+        }
+        head.pooling = tr.pooling;
+        head.layer   = tr.layer;
+        head.n_embd  = d;
+        head.weight  = tr.weight;
+        head.bias    = tr.bias;
+
+        json cv = {{"log_loss", tr.cv.log_loss}, {"accuracy", tr.cv.accuracy}};
+        if (tr.cv.auc >= 0.0) cv["auc"] = tr.cv.auc;
+        if (tr.cv.mae >= 0.0) cv["mae"] = tr.cv.mae;
+
+        json saved = nullptr;
+        if (save) {
+            const std::string path = params.classifier_dir + "/" + head.question_id + ".gguf";
+            char buf[64];
+            snprintf(buf, sizeof buf, "%.6f", tr.cv.log_loss);
+            const std::vector<std::pair<std::string, std::string>> info = {
+                {"n_items",     std::to_string(n)},
+                {"C",           std::to_string(tr.C)},
+                {"balanced",    tp.fit.balanced ? "true" : "false"},
+                {"folds",       std::to_string(tp.folds)},
+                {"cv",          common_classifier_metrics_str(tr.cv, head.type)},
+                {"cv_log_loss", buf},
+            };
+            if (!common_classifier_head_save(path, head, err, info)) {
+                res->error(format_error_response(err, ERROR_TYPE_SERVER));
+                return res;
+            }
+            head.path = path;
+            saved     = path;
+        }
+
+        // register it in the server loop
+        json heads;
+        {
+            auto res2 = create_response();
+            auto & rd2 = res2->rd;
+            server_task task(SERVER_TASK_TYPE_CLASSIFY_ADD_HEAD);
+            task.id              = rd2.get_new_id();
+            task.classifier_head = std::make_shared<common_classifier_head>(head);
+            rd2.post_task(std::move(task));
+            auto result = rd2.next(req.should_stop);
+            if (!result) {
+                return res;
+            }
+            if (result->is_error()) {
+                res->error(result->to_json());
+                return res;
+            }
+            heads = result->to_json();
+        }
+
+        res->ok(json {
+            {"question_id", head.question_id},
+            {"type",        common_classifier_type_name(head.type)},
+            {"options",     head.options},
+            {"layer",       head.layer},
+            {"pooling",     common_classifier_pooling_name(head.pooling)},
+            {"C",           tr.C},
+            {"cv",          cv},
+            {"n_items",     n},
+            {"n_truncated", n_truncated},
+            {"iterations",  tr.iters},
+            {"grid",        tr.log},
+            {"saved",       saved},
+            {"heads",       heads},
+        });
         return res;
     };
 
