@@ -1270,6 +1270,26 @@ void llama_context::set_nextn_layer_offset(int32_t offset) {
 }
 
 void llama_context::set_n_layer_exit(int32_t n) {
+    n = std::max(n, 0);
+    if (cparams.n_layer_exit == n) {
+        return;
+    }
+    // Layers at and above the exit are not computed, so positions processed under a lower exit have no
+    // KV / recurrent state in them. When the exit rises (more layers will run) and the memory holds
+    // tokens, that state would be missing or stale: clear the memory. A lower exit leaves only unused state.
+    const int32_t n_layer = (int32_t) model.hparams.n_layer();
+    auto effective = [n_layer](int32_t x) { return x > 0 && x < n_layer ? x : n_layer; };
+    if (memory && effective(n) > effective(cparams.n_layer_exit)) {
+        bool used = false;
+        for (uint32_t s = 0; s < cparams.n_seq_max && !used; s++) {
+            used = memory->seq_pos_max((llama_seq_id) s) >= 0;
+        }
+        if (used) {
+            LLAMA_LOG_WARN("%s: the exit rises from %d to %d layers while the memory holds tokens; clearing the memory\n",
+                    __func__, effective(cparams.n_layer_exit), effective(n));
+            memory->clear(true);
+        }
+    }
     cparams.n_layer_exit = n;
     sched_need_reserve = true;
 }

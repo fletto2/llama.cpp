@@ -116,8 +116,9 @@ LLAMA_API bool llama_batch_ext_set_decision_order(struct llama_batch_ext * batch
 
 // Early exit: n > 0 builds the trunk graph only up to n layers (then output_norm, pooling /
 // LM head as usual), e.g. for a classifier context sharing the model's weights. 0 (or n >= n_layer)
-// = all layers. The memory (KV / recurrent state) of layers >= n is not updated while n is set:
-// clear the memory when changing n on a context that holds sequences.
+// = all layers. The memory (KV / recurrent state) of layers >= n is not updated while n is set, so when
+// n rises (more layers will run) on a context whose memory holds tokens, the memory is cleared (with a
+// warning); lowering n keeps it.
 LLAMA_API void llama_set_n_layer_exit(struct llama_context * ctx, int32_t n);
 
 // LoRA training: a new adapter with trainable F32 tensors. For every 2D weight of the repeating
