@@ -3838,6 +3838,34 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--lora-train-max-steps"}, "N",
+        string_format("POST /lora/train: maximum optimizer steps of one job, windows x epochs (default: %d)", params.lora_train_max_steps),
+        [](common_params & params, int value) {
+            params.lora_train_max_steps = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--lora-train-max-rank"}, "N",
+        string_format("POST /lora/train: maximum adapter rank (default: %d)", params.lora_train_max_rank),
+        [](common_params & params, int value) {
+            params.lora_train_max_rank = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--lora-train-max-ctx"}, "N",
+        string_format("POST /lora/train: maximum training context n_ctx (default: %d)", params.lora_train_max_ctx),
+        [](common_params & params, int value) {
+            params.lora_train_max_ctx = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--lora-train-max-tokens"}, "N",
+        string_format("POST /lora/train: maximum tokens of training data in one request (default: %lld)", (long long) params.lora_train_max_tokens),
+        [](common_params & params, const std::string & value) {
+            params.lora_train_max_tokens = std::stoll(value);
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--lora-init-without-apply"},
         string_format("load LoRA adapters without applying them (apply later via POST /lora-adapters) (default: %s)", params.lora_init_without_apply ? "enabled" : "disabled"),
         [](common_params & params) {

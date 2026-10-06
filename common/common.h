@@ -535,6 +535,10 @@ struct common_params {
     int32_t classifier_n_ctx = 4096;           // max tokens per classified input
     bool lora_train = false;                   // server: enable POST /lora/train (LoRA training on the loaded model)
     std::string lora_train_dir = "";           // server: where trained adapters are written (default: <temp>/llama-lora-train)
+    int32_t lora_train_max_steps  = 10000;     // server: per-job limits of POST /lora/train (optimizer steps,
+    int32_t lora_train_max_rank   = 128;       //         adapter rank, training context, tokens of training data)
+    int32_t lora_train_max_ctx    = 4096;
+    int64_t lora_train_max_tokens = 4*1024*1024;
     bool lora_init_without_apply = false; // only load lora to memory, but do not apply it to ctx (user can manually apply lora later using llama_adapter_lora_apply)
     std::vector<common_adapter_lora_info> lora_adapters; // lora adapter path with user defined scale
 

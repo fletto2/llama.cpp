@@ -53,8 +53,16 @@ struct server_lora_train_job {
     json to_json() const;
 };
 
+// per-job limits (--lora-train-max-*); a request over any of them is rejected before training starts
+struct server_lora_train_limits {
+    int32_t max_steps  = 10000;
+    int32_t max_rank   = 128;
+    int32_t max_ctx    = 4096;
+    int64_t max_tokens = 4*1024*1024;
+};
+
 struct server_lora_train {
-    explicit server_lora_train(std::string dir) : dir(std::move(dir)) {}
+    server_lora_train(std::string dir, server_lora_train_limits limits) : dir(std::move(dir)), limits(limits) {}
     ~server_lora_train();
 
     // validate a request and queue a job; returns the job id. Throws std::invalid_argument on bad input.
@@ -81,6 +89,7 @@ private:
     void finish(const std::string & status, const std::string & error = "");
 
     std::string dir; // where adapters are written (--lora-train-dir)
+    server_lora_train_limits limits;
     llama_model * model = nullptr;
     int32_t n_threads = 0;
     int next_id = 1;

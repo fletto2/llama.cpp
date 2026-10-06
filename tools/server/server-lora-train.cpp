@@ -92,12 +92,32 @@ int server_lora_train::start(llama_model * model, const llama_vocab * vocab, con
     if (j->n_ctx < 256 || j->n_ctx % 256 != 0) {
         throw std::invalid_argument("n_ctx must be a positive multiple of 256");
     }
+    if (j->rank > limits.max_rank) {
+        throw std::invalid_argument("rank " + std::to_string(j->rank) + " is over the server limit of " +
+                                    std::to_string(limits.max_rank) + " (--lora-train-max-rank)");
+    }
+    if (j->n_ctx > limits.max_ctx) {
+        throw std::invalid_argument("n_ctx " + std::to_string(j->n_ctx) + " is over the server limit of " +
+                                    std::to_string(limits.max_ctx) + " (--lora-train-max-ctx)");
+    }
     if (body.contains("tokens")) {
+        if (body.at("tokens").is_array() && (int64_t) body.at("tokens").size() > limits.max_tokens) {
+            throw std::invalid_argument("the training data has " + std::to_string(body.at("tokens").size()) +
+                                        " tokens, over the server limit of " + std::to_string(limits.max_tokens) + " (--lora-train-max-tokens)");
+        }
         j->tokens = body.at("tokens").get<llama_tokens>();
     } else if (body.contains("text")) {
-        j->tokens = common_tokenize(vocab, body.at("text").get<std::string>(), /*add_special*/ true, /*parse_special*/ false);
+        const std::string text = body.at("text").get<std::string>();
+        if ((int64_t) text.size() > 16 * limits.max_tokens) {
+            throw std::invalid_argument("the training text is over 16 bytes x --lora-train-max-tokens");
+        }
+        j->tokens = common_tokenize(vocab, text, /*add_special*/ true, /*parse_special*/ false);
     } else {
         throw std::invalid_argument("\"text\" or \"tokens\" is required");
+    }
+    if ((int64_t) j->tokens.size() > limits.max_tokens) {
+        throw std::invalid_argument("the training data has " + std::to_string(j->tokens.size()) +
+                                    " tokens, over the server limit of " + std::to_string(limits.max_tokens) + " (--lora-train-max-tokens)");
     }
     const int32_t n_vocab = llama_vocab_n_tokens(vocab);
     for (const llama_token t : j->tokens) {
@@ -110,6 +130,11 @@ int server_lora_train::start(llama_model * model, const llama_vocab * vocab, con
                                     " tokens, at least n_ctx + 1 = " + std::to_string(j->n_ctx + 1) + " are needed");
     }
     j->n_steps = n_windows(*j) * j->epochs;
+    if (j->n_steps > limits.max_steps) {
+        throw std::invalid_argument("the job needs " + std::to_string(j->n_steps) + " optimizer steps (" +
+                                    std::to_string(n_windows(*j)) + " windows x " + std::to_string(j->epochs) +
+                                    " epochs), over the server limit of " + std::to_string(limits.max_steps) + " (--lora-train-max-steps)");
+    }
     j->id = next_id++;
     std::error_code ec;
     std::filesystem::create_directories(dir, ec);

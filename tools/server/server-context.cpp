@@ -1248,8 +1248,13 @@ private:
             }
         }
         if (params_base.lora_train) {
+            server_lora_train_limits limits;
+            limits.max_steps  = params_base.lora_train_max_steps;
+            limits.max_rank   = params_base.lora_train_max_rank;
+            limits.max_ctx    = params_base.lora_train_max_ctx;
+            limits.max_tokens = params_base.lora_train_max_tokens;
             lora_train = std::make_unique<server_lora_train>(!params_base.lora_train_dir.empty() ? params_base.lora_train_dir :
-                (std::filesystem::temp_directory_path() / "llama-lora-train").string());
+                (std::filesystem::temp_directory_path() / "llama-lora-train").string(), limits);
         }
 
         try {
@@ -5874,7 +5879,11 @@ void server_routes::init_routes() {
         std::vector<llama_tokens> items;
         auto tokenize = [&](const json & p) -> llama_tokens {
             if (p.is_string()) {
-                return common_tokenize(ctx_server.vocab, p.get<std::string>(), true, true);
+                const std::string text = p.get<std::string>();
+                if (text.empty()) {
+                    return llama_tokens(); // rejected below; otherwise the BOS token alone would be classified
+                }
+                return common_tokenize(ctx_server.vocab, text, true, true);
             }
             return p.get<llama_tokens>();
         };
