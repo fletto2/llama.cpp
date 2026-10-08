@@ -168,7 +168,8 @@ The training context (F32 KV cache, AdamW state, the backward graph) needs memor
 On a board whose integrated GPU shares memory with the CPU, the GPU can compute part of each prompt-sized Q4_0 matrix product while the CPU threads compute the rest. Decode is bound by memory bandwidth, which the two share, so only prompt processing gains.
 
 - Build the CPU backend with `-DGGML_CPU_COPROC_VULKAN=ON` (needs the Vulkan loader and headers, `glslc`, and the CPU repack path, which is on by default). It works without the Vulkan backend.
-- `GGML_CPU_COPROC=<fraction>` turns it on: the share of each Q4_0 weight's rows (rounded down to 128) that the GPU computes. When the repack buffer loads the weights, those rows are also copied into GPU buffers.
+- `GGML_CPU_COPROC=<fraction>` turns it on: the starting share of each Q4_0 weight's rows (in blocks of 128) that the GPU computes. When the repack buffer loads the weights, up to `GGML_CPU_COPROC_MAX` of the rows (default: the share + 0.15) are also copied into GPU buffers.
+- The share adapts per weight: one block more when the GPU finished before the CPU, one block fewer when the CPU waited more than 3% of the product's time. This follows the CPU's speed as it throttles. `GGML_CPU_COPROC_ADAPT=0` keeps the share fixed.
 - `GGML_CPU_COPROC_MIN_N` (default 32): only products with at least this many tokens use the GPU. `GGML_CPU_COPROC_DEVICE` picks the Vulkan device. `GGML_CPU_COPROC_STATS=1` prints timing totals at exit.
 - The GPU kernel (`ggml/src/ggml-cpu/coproc-q4_0.comp`) uses the packed int8 dot product (Vulkan 1.3 `shaderIntegerDotProduct`) on Q4_0 weights and Q8_1 activations.
 

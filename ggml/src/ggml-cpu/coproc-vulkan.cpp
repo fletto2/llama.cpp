@@ -11,6 +11,7 @@
 
 #include <vulkan/vulkan.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -53,7 +54,10 @@ double now_s() {
 
 struct coproc_ctx {
     bool ok = false;
-    float fraction = 0.0f;
+    float fraction = 0.0f;      // initial share of the rows
+    float max_fraction = 0.0f;  // share of the rows copied to the GPU (the most it can take)
+    bool adaptive = true;
+    int64_t gpu_rows = 0, all_rows = 0, n_weights = 0;  // sum of rows_cur and of M over the weights
     int64_t min_n = 32;
     bool stats_enabled = false;
     coproc_stats stats;
@@ -99,7 +103,9 @@ struct ggml_cpu_coproc_weight {
     const void *        data;
     int64_t             M;       // rows of the weight
     int64_t             K;       // columns
-    int64_t             rows;    // GPU rows: the last `rows` of the weight
+    int64_t             rows;    // rows held by the GPU: the last `rows` of the weight
+    int64_t             rows_cur;  // rows the GPU computes now: the last `rows_cur` (adaptive, <= rows)
+    int64_t             rows_run;  // rows_cur of the product in flight
     coproc_buffer       qa;      // nibbles, [NB][rows] x 16 bytes
     coproc_buffer       sa;      // scales, [NB][rows] floats
     VkDescriptorSet     ds = VK_NULL_HANDLE;
@@ -152,6 +158,11 @@ void print_stats() {
     fprintf(stderr, "coproc: %lld GPU products (%lld packed their activations), GPU %.3f s, CPU waiting for the GPU %.3f s, "
             "packing %.3f s, copying %.3f s\n", (long long) c.stats.calls, (long long) c.stats.packed, c.stats.t_gpu,
             c.stats.t_wait, c.stats.t_pack, c.stats.t_copy);
+    if (c.adaptive) {
+        // running totals: the weight map may already be destroyed when this runs at exit
+        fprintf(stderr, "coproc: adaptive share at exit %.3f of the rows (%lld weights)\n",
+                c.all_rows ? (double) c.gpu_rows / c.all_rows : 0.0, (long long) c.n_weights);
+    }
 }
 
 // lazy initialization on the first Q4_0 weight; false when the feature is off or no device is usable
@@ -169,6 +180,18 @@ bool init(coproc_ctx & c) {
     }
     if (c.fraction > 0.9f) {
         c.fraction = 0.9f;
+    }
+    c.max_fraction = c.fraction;
+    if (const char * m = getenv("GGML_CPU_COPROC_MAX")) {
+        c.max_fraction = std::min(0.9f, std::max(c.fraction, (float) atof(m)));
+    } else {
+        c.max_fraction = std::min(0.9f, c.fraction + 0.15f);
+    }
+    if (const char * a = getenv("GGML_CPU_COPROC_ADAPT")) {
+        c.adaptive = atoi(a) != 0;
+    }
+    if (!c.adaptive) {
+        c.max_fraction = c.fraction;
     }
     if (const char * n = getenv("GGML_CPU_COPROC_MIN_N")) {
         c.min_n = atoll(n);
@@ -206,8 +229,8 @@ bool init(coproc_ctx & c) {
                 continue;
             }
             c.pdev = pds[i];
-            GGML_LOG_INFO("%s: co-processing on %s, %.0f%% of the rows of Q4_0 weights, products with >= %lld columns\n",
-                          __func__, pp.deviceName, 100.0 * c.fraction, (long long) c.min_n);
+            GGML_LOG_INFO("%s: co-processing on %s, %.0f%% of the rows of Q4_0 weights%s, products with >= %lld columns\n",
+                          __func__, pp.deviceName, 100.0 * c.fraction, c.adaptive ? " to start (adaptive)" : "", (long long) c.min_n);
             break;
         }
     }
@@ -277,7 +300,7 @@ bool init(coproc_ctx & c) {
     dli.bindingCount = 4;
     dli.pBindings = lb;
     COPROC_CHECK(vkCreateDescriptorSetLayout(c.dev, &dli, nullptr, &c.dsl));
-    VkPushConstantRange pcr = { VK_SHADER_STAGE_COMPUTE_BIT, 0, 12 };
+    VkPushConstantRange pcr = { VK_SHADER_STAGE_COMPUTE_BIT, 0, 20 };
     VkPipelineLayoutCreateInfo pli = {};
     pli.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
     pli.setLayoutCount = 1;
@@ -358,7 +381,8 @@ void ggml_cpu_coproc_prepare(const struct ggml_tensor * t, const void * data) {
         return;
     }
     const int64_t K = t->ne[0], M = t->ne[1], NB = K / QK4_0;
-    const int64_t rows = (int64_t) (c.fraction * (float) M) / COPROC_ROW_ALIGN * COPROC_ROW_ALIGN;
+    const int64_t rows = (int64_t) (c.max_fraction * (float) M) / COPROC_ROW_ALIGN * COPROC_ROW_ALIGN;
+    const int64_t rows_cur = (int64_t) (c.fraction * (float) M) / COPROC_ROW_ALIGN * COPROC_ROW_ALIGN;
     if (rows <= 0) {
         return;
     }
@@ -369,6 +393,10 @@ void ggml_cpu_coproc_prepare(const struct ggml_tensor * t, const void * data) {
     w->M = M;
     w->K = K;
     w->rows = rows;
+    w->rows_cur = std::max<int64_t>(rows_cur, COPROC_ROW_ALIGN);
+    c.gpu_rows += w->rows_cur;
+    c.all_rows += M;
+    c.n_weights++;
     w->qa = make_buffer(c, (size_t) NB * rows * 16);
     w->sa = make_buffer(c, (size_t) NB * rows * sizeof(float));
 
@@ -405,7 +433,7 @@ struct ggml_cpu_coproc_weight * ggml_cpu_coproc_find(const struct ggml_tensor * 
 }
 
 int64_t ggml_cpu_coproc_rows(const struct ggml_cpu_coproc_weight * w, int64_t n_cols) {
-    return w && n_cols >= ctx().min_n ? w->rows : 0;
+    return w && n_cols >= ctx().min_n ? w->rows_cur : 0;
 }
 
 void ggml_cpu_coproc_setup(struct ggml_cpu_coproc_weight * w, const struct ggml_tensor * src1) {
@@ -417,7 +445,7 @@ void ggml_cpu_coproc_setup(struct ggml_cpu_coproc_weight * w, const struct ggml_
     GGML_ASSERT(src1->ne[0] == K && src1->type == GGML_TYPE_F32);
 
     const size_t act_size = (size_t) Np * NB * sizeof(block_q8_1);
-    const size_t out_size = (size_t) Np * w->rows * sizeof(float);
+    const size_t out_size = (size_t) Np * w->rows_cur * sizeof(float);
     if (c.act.size < act_size) {
         free_buffer(c, c.act);
         c.act = make_buffer(c, act_size + act_size / 4);
@@ -440,6 +468,7 @@ void ggml_cpu_coproc_setup(struct ggml_cpu_coproc_weight * w, const struct ggml_
         c.act_sample = sample;
     }
     w->n_cols = N;
+    w->rows_run = w->rows_cur;
 }
 
 void ggml_cpu_coproc_pack(struct ggml_cpu_coproc_weight * w, const struct ggml_tensor * src1, int ith, int nth) {
@@ -494,9 +523,10 @@ void ggml_cpu_coproc_submit(struct ggml_cpu_coproc_weight * w) {
     vkCmdBindPipeline(c.cb, VK_PIPELINE_BIND_POINT_COMPUTE, c.pipeline);
     vkCmdBindDescriptorSets(c.cb, VK_PIPELINE_BIND_POINT_COMPUTE, c.pl, 0, 1, &w->ds, 0, nullptr);
     // one dispatch: x = row blocks, y = column groups (a small share of rows still fills the GPU)
-    const uint32_t pc[3] = { (uint32_t) w->rows, (uint32_t) Np, (uint32_t) NB };
+    const uint32_t pc[5] = { (uint32_t) w->rows, (uint32_t) Np, (uint32_t) NB, (uint32_t) (w->rows - w->rows_run),
+                             (uint32_t) w->rows_run };
     vkCmdPushConstants(c.cb, c.pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), pc);
-    vkCmdDispatch(c.cb, (uint32_t) (w->rows / COPROC_ROW_ALIGN), (uint32_t) (Np / COPROC_C), 1);
+    vkCmdDispatch(c.cb, (uint32_t) (w->rows_run / COPROC_ROW_ALIGN), (uint32_t) (Np / COPROC_C), 1);
     COPROC_CHECK(vkEndCommandBuffer(c.cb));
     VkSubmitInfo si = {};
     si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
@@ -513,9 +543,21 @@ void ggml_cpu_coproc_wait(struct ggml_cpu_coproc_weight * w) {
     coproc_ctx & c = ctx();
     GGML_ASSERT(w->running);
     const double t0 = now_s();
+    const bool gpu_done_first = vkGetFenceStatus(c.dev, c.fence) == VK_SUCCESS;
     COPROC_CHECK(vkWaitForFences(c.dev, 1, &c.fence, VK_TRUE, UINT64_MAX));
     COPROC_CHECK(vkResetFences(c.dev, 1, &c.fence));
     const double t1 = now_s();
+    // adaptive share: the GPU idled while the CPU worked -> one more block of rows; the CPU waited more than 3%
+    // of the product's time -> one block fewer. Every thread reads rows_cur only after the next graph barrier.
+    if (c.adaptive) {
+        const int64_t before = w->rows_cur;
+        if (gpu_done_first) {
+            w->rows_cur = std::min(w->rows, w->rows_cur + COPROC_ROW_ALIGN);
+        } else if (t1 - t0 > 0.03 * (t1 - c.t_setup)) {
+            w->rows_cur = std::max<int64_t>(COPROC_ROW_ALIGN, w->rows_cur - COPROC_ROW_ALIGN);
+        }
+        c.gpu_rows += w->rows_cur - before;
+    }
     w->running = false;
     c.stats.calls++;
     c.stats.t_gpu += t1 - w->t_submit;
@@ -528,8 +570,8 @@ void ggml_cpu_coproc_copy(struct ggml_cpu_coproc_weight * w, struct ggml_tensor 
     // y is [Np][rows]; dst column col holds rows [M - rows, M) of the product; thread ith copies columns ith, ith + nth, ...
     const float * y = (const float *) c.out.ptr;
     for (int64_t col = ith; col < w->n_cols; col += nth) {
-        float * d = (float *) ((char *) dst->data + col * dst->nb[1]) + (w->M - w->rows);
-        memcpy(d, y + col * w->rows, w->rows * sizeof(float));
+        float * d = (float *) ((char *) dst->data + col * dst->nb[1]) + (w->M - w->rows_run);
+        memcpy(d, y + col * w->rows_run, w->rows_run * sizeof(float));
     }
     if (ith == 0) {
         c.stats.t_copy += now_s() - c.t_wait_end;
