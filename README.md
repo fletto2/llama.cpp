@@ -6,6 +6,7 @@ This is [llama.cpp](https://github.com/ggml-org/llama.cpp) plus a few small patc
 - **LoRA training:** train a LoRA adapter in C/C++ on a frozen base model, including a quantized one, on CPU or GPU, and save it as a GGUF adapter that `--lora` loads.
 - **Classifier heads** on the hidden states of the loaded model: yes/no (`noul`), multiple-choice (`choice`) and ordinal (`score`) questions. `llama-classifier` extracts features and trains heads. llama-server answers with them (`POST /classify`), returns pooled hidden states (`POST /features`) and trains new heads live (`POST /classify/train`).
 - **llama-server LoRA training** on the loaded model between requests (`--lora-train`, `POST /lora/train`).
+- **CPU + integrated GPU co-processing** of Q4_0 matrix products for prompt processing on boards whose GPU shares memory with the CPU (`GGML_CPU_COPROC_VULKAN`).
 
 Everything else is unchanged upstream code. For building, models, tools and the full documentation, see the [official llama.cpp README](https://github.com/ggml-org/llama.cpp/blob/master/README.md).
 
@@ -161,3 +162,15 @@ With `--lora-train`, weight repacking is turned off.
 Recurrent, hybrid (SSM / DeltaNet), MoE and diffusion models are rejected: some of their ops have no backward pass.
 
 The training context (F32 KV cache, AdamW state, the backward graph) needs memory on top of the served model.
+
+## CPU + GPU co-processing (`GGML_CPU_COPROC_VULKAN`)
+
+On a board whose integrated GPU shares memory with the CPU, the GPU can compute part of each prompt-sized Q4_0 matrix product while the CPU threads compute the rest. Decode is bound by memory bandwidth, which the two share, so only prompt processing gains.
+
+- Build the CPU backend with `-DGGML_CPU_COPROC_VULKAN=ON` (needs the Vulkan loader and headers, `glslc`, and the CPU repack path, which is on by default). It works without the Vulkan backend.
+- `GGML_CPU_COPROC=<fraction>` turns it on: the share of each Q4_0 weight's rows (rounded down to 128) that the GPU computes. When the repack buffer loads the weights, those rows are also copied into GPU buffers.
+- `GGML_CPU_COPROC_MIN_N` (default 32): only products with at least this many tokens use the GPU. `GGML_CPU_COPROC_DEVICE` picks the Vulkan device. `GGML_CPU_COPROC_STATS=1` prints timing totals at exit.
+- The GPU kernel (`ggml/src/ggml-cpu/coproc-q4_0.comp`) uses the packed int8 dot product (Vulkan 1.3 `shaderIntegerDotProduct`) on Q4_0 weights and Q8_1 activations.
+
+Measured with Qwen3-1.7B Q4_0, 4 threads, prompt 512 tokens, on a 4-core single-board computer whose integrated GPU uses the Mesa v3dv driver, no fan: 92.0 tok/s on the CPU alone, 104.5 tok/s with `GGML_CPU_COPROC=0.3` (+13.5%); perplexity unchanged within its error. That driver needs a fix to run compute workgroups concurrently: Mesa leaves the dispatch's maximum supergroup ID at 0, so its workgroups run one at a time and the GPU is about 4x slower.
+

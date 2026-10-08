@@ -622,6 +622,28 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
         target_compile_definitions(${GGML_CPU_NAME} PRIVATE GGML_USE_CPU_REPACK)
     endif()
 
+    if (GGML_CPU_COPROC_VULKAN)
+        if (NOT GGML_CPU_REPACK)
+            message(FATAL_ERROR "GGML_CPU_COPROC_VULKAN requires GGML_CPU_REPACK")
+        endif()
+        find_package(Vulkan COMPONENTS glslc REQUIRED)
+        set(COPROC_GEN_DIR ${CMAKE_CURRENT_BINARY_DIR}/${GGML_CPU_NAME}-coproc)
+        set(COPROC_SPV ${COPROC_GEN_DIR}/coproc-q4_0.spv)
+        set(COPROC_HDR ${COPROC_GEN_DIR}/coproc-q4_0.spv.h)
+        add_custom_command(
+            OUTPUT  ${COPROC_HDR}
+            COMMAND ${CMAKE_COMMAND} -E make_directory ${COPROC_GEN_DIR}
+            COMMAND ${Vulkan_GLSLC_EXECUTABLE} --target-env=vulkan1.3 ${CMAKE_CURRENT_SOURCE_DIR}/ggml-cpu/coproc-q4_0.comp -o ${COPROC_SPV}
+            COMMAND ${CMAKE_COMMAND} -DSPV=${COPROC_SPV} -DHDR=${COPROC_HDR} -DNAME=coproc_q4_0_spv
+                    -P ${CMAKE_CURRENT_SOURCE_DIR}/ggml-cpu/cmake/spv-to-header.cmake
+            DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/ggml-cpu/coproc-q4_0.comp ${CMAKE_CURRENT_SOURCE_DIR}/ggml-cpu/cmake/spv-to-header.cmake
+            COMMENT "Compiling the CPU co-processing shader")
+        target_sources(${GGML_CPU_NAME} PRIVATE ggml-cpu/coproc-vulkan.cpp ggml-cpu/coproc-vulkan.h ${COPROC_HDR})
+        target_include_directories(${GGML_CPU_NAME} PRIVATE ${COPROC_GEN_DIR})
+        target_compile_definitions(${GGML_CPU_NAME} PRIVATE GGML_USE_CPU_COPROC_VULKAN)
+        target_link_libraries(${GGML_CPU_NAME} PRIVATE Vulkan::Vulkan)
+    endif()
+
     if (GGML_CPU_KLEIDIAI)
         # upstream repo requires at least cmake 3.16
         if (CMAKE_VERSION VERSION_LESS 3.16)

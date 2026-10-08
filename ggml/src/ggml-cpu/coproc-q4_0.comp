@@ -1,0 +1,73 @@
+#version 450
+
+// CPU + GPU co-processing (GGML_CPU_COPROC_VULKAN): the GPU's share of a Q4_0 matrix product, for integrated
+// GPUs that share memory with the CPU (tuned on a Mesa v3dv device). Q4_0 weights x Q8_1 activations with the packed
+// int8 dot product: y[c][r] = sum_j dA[j][r] * (d[c][j] * t - 8 * s[c][j]), t = sum of the 32 products nibble * q8,
+// s = d * sum of the 32 q8.
+// Lanes own rows (R per lane), workgroup y owns a group of C columns: every lane of a GPU thread reads the same
+// activations, so those loads are lane-uniform and the compiler can read them through the uniform stream instead
+// of the texture unit. The column group is broadcast from the first lane so the compiler can prove it uniform
+// (v3dv treats gl_WorkGroupID as divergent). Only the weights go through the texture unit.
+
+#extension GL_EXT_integer_dot_product : require
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_KHR_shader_subgroup_ballot : require
+
+#define R 2
+#define C 8
+
+layout(local_size_x = 64) in;
+
+// weight nibbles of the GPU's rows, block-major [NB][M]: qs[e] low nibble = element e, high nibble = element e + 16
+layout(std430, binding = 0) readonly buffer A  { uvec4 qa[]; };
+// weight scales, block-major [NB][M]
+layout(std430, binding = 1) readonly buffer AS { float sa[]; };
+// activations as block_q8_1, one stream per group of C columns: [N / C][NB][C][d, s (half2), 32 int8] (9 words)
+layout(std430, binding = 2) readonly buffer B  { uint qb[]; };
+// result [N][M]
+layout(std430, binding = 3) writeonly buffer Y { float y[]; };
+
+layout(push_constant) uniform PC { uint M; uint N; uint NB; } p;
+
+void main() {
+    const uint r0 = gl_GlobalInvocationID.x * R;
+    const uint cg = subgroupBroadcastFirst(gl_WorkGroupID.y);
+    const uint c0 = cg * C;
+
+    float acc[R * C];
+    [[unroll]] for (int i = 0; i < R * C; i++) acc[i] = 0.0;
+
+    for (uint j = 0; j < p.NB; j++) {
+        ivec4 lo[R], hi[R];
+        float da[R];
+        [[unroll]] for (int i = 0; i < R; i++) {
+            const uvec4 w = qa[j * p.M + r0 + i];
+            da[i] = sa[j * p.M + r0 + i];
+            lo[i] = ivec4(w & 0x0F0F0F0Fu);
+            hi[i] = ivec4((w >> 4) & 0x0F0F0F0Fu);
+        }
+        [[unroll]] for (int c = 0; c < C; c++) {
+            const uint o = ((cg * p.NB + j) * C + c) * 9;
+            const vec2 ds = unpackHalf2x16(qb[o]);
+            const ivec4 b0 = ivec4(qb[o + 1], qb[o + 2], qb[o + 3], qb[o + 4]);
+            const ivec4 b1 = ivec4(qb[o + 5], qb[o + 6], qb[o + 7], qb[o + 8]);
+            [[unroll]] for (int i = 0; i < R; i++) {
+                int t = dotPacked4x8EXT(lo[i].x, b0.x);
+                t += dotPacked4x8EXT(lo[i].y, b0.y);
+                t += dotPacked4x8EXT(lo[i].z, b0.z);
+                t += dotPacked4x8EXT(lo[i].w, b0.w);
+                t += dotPacked4x8EXT(hi[i].x, b1.x);
+                t += dotPacked4x8EXT(hi[i].y, b1.y);
+                t += dotPacked4x8EXT(hi[i].z, b1.z);
+                t += dotPacked4x8EXT(hi[i].w, b1.w);
+                acc[i * C + c] += da[i] * (ds.x * float(t) - 8.0 * ds.y);
+            }
+        }
+    }
+
+    [[unroll]] for (int c = 0; c < C; c++) {
+        [[unroll]] for (int i = 0; i < R; i++) {
+            y[(c0 + c) * p.M + r0 + i] = acc[i * C + c];
+        }
+    }
+}

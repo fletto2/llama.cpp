@@ -18,6 +18,10 @@
 
 #include "repack.h"
 
+#ifdef GGML_USE_CPU_COPROC_VULKAN
+#include "coproc-vulkan.h"
+#endif
+
 #if defined(__GNUC__)
 #pragma GCC diagnostic ignored "-Woverlength-strings"
 #endif
@@ -4708,8 +4712,19 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
         // disable for NUMA
         const bool disable_chunking = ggml_is_numa();
 
+#ifdef GGML_USE_CPU_COPROC_VULKAN
+        // co-processing: the GPU computes the last gpu_rows rows while the CPU threads compute the others
+        ggml_cpu_coproc_weight * coproc = ne12 == 1 ? ggml_cpu_coproc_find(src0) : nullptr;
+        const int64_t gpu_rows = ggml_cpu_coproc_rows(coproc, ne11);
+        if (gpu_rows > 0 && ith == 0) {
+            ggml_cpu_coproc_setup(coproc, src1);  // published to the other threads by the barrier below
+        }
+#else
+        const int64_t gpu_rows = 0;
+#endif
+
         // 4x chunks per thread
-        const int64_t nr0 = ggml_nrows(op->src[0]);
+        const int64_t nr0 = ggml_nrows(op->src[0]) - gpu_rows;
 
         int     nth_scaled  = nth * 4;
         int64_t chunk_size0 = (nr0 + nth_scaled - 1) / nth_scaled;
@@ -4748,6 +4763,16 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
 
         ggml_barrier(params->threadpool);
 
+#ifdef GGML_USE_CPU_COPROC_VULKAN
+        if (gpu_rows > 0) {
+            ggml_cpu_coproc_pack(coproc, src1, ith, nth);
+            ggml_barrier(params->threadpool);
+            if (ith == 0) {
+                ggml_cpu_coproc_submit(coproc);
+            }
+        }
+#endif
+
         // The first chunk comes from our thread_id, the rest will get auto-assigned.
         int current_chunk = ith;
 
@@ -4766,7 +4791,7 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
             // The chunk size limiting above ensures chunks are large enough to prevent overlaps
             src0_start = (src0_start % NB_COLS) ? src0_start + NB_COLS - (src0_start % NB_COLS) : src0_start;
             src0_end   = (src0_end % NB_COLS) ? src0_end + NB_COLS - (src0_end % NB_COLS) : src0_end;
-            src0_end   = MIN(src0_end, ne01);
+            src0_end   = MIN(src0_end, nr0);
 
             // Make sure current plane is the last one before exiting
             if (src0_start >= src0_end) {
@@ -4778,6 +4803,16 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
 
             current_chunk = ggml_threadpool_chunk_add(params->threadpool, 1);
         }
+
+#ifdef GGML_USE_CPU_COPROC_VULKAN
+        if (gpu_rows > 0) {
+            if (ith == 0) {
+                ggml_cpu_coproc_wait(coproc);
+            }
+            ggml_barrier(params->threadpool);
+            ggml_cpu_coproc_copy(coproc, dst, ith, nth);  // the graph's barrier after this node completes dst
+        }
+#endif
     }
 
     void forward_mul_mat_id(ggml_compute_params * params, ggml_tensor * op) {
@@ -5156,6 +5191,11 @@ static void ggml_backend_cpu_repack_buffer_set_tensor(ggml_backend_buffer_t buff
     auto OK            = tensor_traits->repack(tensor, data, size);
 
     GGML_ASSERT(OK == 0);
+
+#ifdef GGML_USE_CPU_COPROC_VULKAN
+    // copy the rows the GPU will compute (the data is still in the standard layout here)
+    ggml_cpu_coproc_prepare(tensor, data);
+#endif
     GGML_UNUSED(buffer);
 }
 
