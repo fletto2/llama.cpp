@@ -13,6 +13,7 @@
 
 #include "ggml.h"
 #include "ggml-backend.h"
+#include "ggml-alloc.h"
 
 #include <algorithm>
 #include <cmath>
@@ -55,10 +56,6 @@ struct bolmo_trie {
     }
 };
 
-float logsigmoidf(float x) {
-    return x < 0.0f ? x - log1pf(expf(x)) : -log1pf(expf(-x));
-}
-
 } // namespace
 
 struct llama_bolmo {
@@ -71,10 +68,13 @@ struct llama_bolmo {
     std::vector<ggml_backend_t> backends;
     ggml_backend_sched_t sched = nullptr;
 
-    // per local layer: C (H*DK*DV), n (H*DK), m (H), in a host buffer (the mLSTM op runs on the CPU)
+    // per local layer: the mLSTM memory C [DK, DV, H] and normalizer n [DK, 1, H], unstabilized (see build_mlstm),
+    // next to the layer's weights
     ggml_context * ctx_state = nullptr;
-    ggml_backend_buffer_t buf_state = nullptr;
-    std::vector<ggml_tensor *> states;
+    std::vector<ggml_backend_buffer_t> buf_state;
+    std::vector<ggml_tensor *> state_c;
+    std::vector<ggml_tensor *> state_n;
+    ggml_cgraph * gf_cur = nullptr; // graph being built (receives the state writes)
 
     std::vector<uint8_t> meta;
     bolmo_trie trie;
@@ -93,8 +93,8 @@ struct llama_bolmo {
         for (auto * b : backends) {
             ggml_backend_free(b);
         }
-        if (buf_state) {
-            ggml_backend_buffer_free(buf_state);
+        for (auto * b : buf_state) {
+            ggml_backend_buffer_free(b);
         }
         if (ctx_state) {
             ggml_free(ctx_state);
@@ -112,6 +112,8 @@ struct llama_bolmo {
         return ggml_init(p);
     }
 
+    ggml_tensor * build_mlstm(ggml_context * c, ggml_tensor * q, ggml_tensor * k, ggml_tensor * v,
+                              ggml_tensor * ig, ggml_tensor * fg, int il);
     ggml_tensor * build_local_layer(ggml_context * c, ggml_tensor * x, int il);
     bool compute(ggml_cgraph * gf);
 
@@ -124,69 +126,6 @@ struct llama_bolmo {
 
     void reset();
 };
-
-// mLSTM recurrence, stabilized (mlstm_kernels native step), state updated in place.
-// src: q [DK,H,T], k [DK,H,T], v [DV,H,T], i [H,T], f [H,T], state; dst: [DV,H,T]
-static void bolmo_mlstm_op(ggml_tensor * dst, int ith, int nth, void * userdata) {
-    const float eps = *(const float *) userdata;
-
-    const ggml_tensor * q  = dst->src[0];
-    const ggml_tensor * k  = dst->src[1];
-    const ggml_tensor * v  = dst->src[2];
-    const ggml_tensor * ig = dst->src[3];
-    const ggml_tensor * fg = dst->src[4];
-    ggml_tensor       * st = dst->src[5];
-
-    const int64_t DK = q->ne[0];
-    const int64_t H  = q->ne[1];
-    const int64_t T  = q->ne[2];
-    const int64_t DV = v->ne[0];
-
-    const float scale = 1.0f / sqrtf((float) DK);
-
-    float * S = (float *) st->data;
-
-    for (int64_t h = ith; h < H; h += nth) {
-        float * C = S + h*DK*DV;
-        float * N = S + H*DK*DV + h*DK;
-        float * M = S + H*DK*DV + H*DK + h;
-
-        for (int64_t t = 0; t < T; ++t) {
-            const float * qt = (const float *) ((const char *) q->data + t*q->nb[2] + h*q->nb[1]);
-            const float * kt = (const float *) ((const char *) k->data + t*k->nb[2] + h*k->nb[1]);
-            const float * vt = (const float *) ((const char *) v->data + t*v->nb[2] + h*v->nb[1]);
-            const float   it = *(const float *) ((const char *) ig->data + t*ig->nb[1] + h*ig->nb[0]);
-            const float   ft = *(const float *) ((const char *) fg->data + t*fg->nb[1] + h*fg->nb[0]);
-            float       * ot = (float *) ((char *) dst->data + t*dst->nb[2] + h*dst->nb[1]);
-
-            const float flog = logsigmoidf(ft);
-            const float mnew = std::max(flog + *M, it);
-            const float fa   = expf(flog + *M - mnew);
-            const float ia   = expf(it - mnew);
-
-            for (int64_t b = 0; b < DV; ++b) {
-                ot[b] = 0.0f;
-            }
-            float qn = 0.0f;
-            for (int64_t a = 0; a < DK; ++a) {
-                const float ka = ia*kt[a];
-                const float qa = qt[a]*scale;
-                float * row = C + a*DV;
-                for (int64_t b = 0; b < DV; ++b) {
-                    row[b] = fa*row[b] + ka*vt[b];
-                    ot[b] += qa*row[b];
-                }
-                N[a] = fa*N[a] + ka;
-                qn += qa*N[a];
-            }
-            const float denom = std::max(fabsf(qn), expf(-mnew)) + eps;
-            for (int64_t b = 0; b < DV; ++b) {
-                ot[b] /= denom;
-            }
-            *M = mnew;
-        }
-    }
-}
 
 int32_t llama_bolmo::expand_at(int32_t i) const {
     // BolmoTokenizer.expand_byte_ids for one position
@@ -212,6 +151,75 @@ int32_t llama_bolmo::expand_at(int32_t i) const {
     return best < 0 ? 0 : best;
 }
 
+// The mLSTM cell (xLSTM mLSTMLayer, mlstm_kernels backend) without the max-stabilizer m:
+//   C_t = f_t C_{t-1} + i_t k_t v_t^T,  n_t = f_t n_{t-1} + i_t k_t,  f_t = sigmoid(f~), i_t = exp(i~)
+//   h_t = (q_t/sqrt(DK))^T C_t / (max(|(q_t/sqrt(DK))^T n_t|, 1) + eps)
+// The kernels carry C, n scaled by exp(-m) and use max(|q.n|, exp(-m)); both forms give the same h up to eps.
+// Unstabilized is safe in float32 here because the gates are soft-capped: i~ <= 15 and log f <= 0, so no
+// weight exceeds exp(15). Prefill (T > 1, from the zero state) uses the parallel form, generation (T = 1)
+// the recurrent step; both are plain ggml ops, so they run on any backend.
+ggml_tensor * llama_bolmo::build_mlstm(ggml_context * c, ggml_tensor * q, ggml_tensor * k, ggml_tensor * v,
+                                       ggml_tensor * ig, ggml_tensor * fg, int il) {
+    const int64_t T = q->ne[1];
+    const float scale = 1.0f / sqrtf((float) DK);
+    const float eps   = m->mlstm_norm_eps;
+
+    // max(|x|, 1) + eps
+    auto denom = [&](ggml_tensor * x) {
+        x = ggml_relu(c, ggml_scale_bias(c, ggml_abs(c, x), 1.0f, -1.0f));
+        return ggml_scale_bias(c, x, 1.0f, 1.0f + eps);
+    };
+
+    if (T == 1) {
+        ggml_tensor * C = state_c[il];
+        ggml_tensor * N = state_n[il];
+        ggml_tensor * q3 = ggml_reshape_3d(c, ggml_cont(c, q), DK, 1, H);
+        ggml_tensor * k3 = ggml_reshape_3d(c, ggml_cont(c, k), DK, 1, H);
+        ggml_tensor * fa = ggml_reshape_3d(c, ggml_sigmoid(c, fg), 1, 1, H);
+        ggml_tensor * ia = ggml_reshape_3d(c, ggml_exp(c, ig), 1, 1, H);
+
+        // outer products k v^T per head: [1, DK, H] x [1, DV, H] -> [DK, DV, H]
+        ggml_tensor * kv = ggml_mul_mat(c, ggml_reshape_3d(c, k3, 1, DK, H), ggml_reshape_3d(c, ggml_cont(c, v), 1, DV, H));
+        ggml_tensor * Cn = ggml_add(c, ggml_mul(c, C, fa), ggml_mul(c, kv, ia));
+        ggml_tensor * Nn = ggml_add(c, ggml_mul(c, N, fa), ggml_mul(c, k3, ia));
+        ggml_build_forward_expand(gf_cur, ggml_cpy(c, Cn, C));
+        ggml_build_forward_expand(gf_cur, ggml_cpy(c, Nn, N));
+
+        ggml_tensor * num = ggml_scale(c, ggml_mul_mat(c, Cn, q3), scale); // [DV, 1, H]
+        ggml_tensor * qn  = ggml_scale(c, ggml_mul_mat(c, Nn, q3), scale); // [1, 1, H]
+        ggml_tensor * h = ggml_div(c, num, denom(qn));
+        return ggml_reshape_3d(c, h, DV, H, 1);
+    }
+
+    // parallel form over T positions from the zero state
+    ggml_tensor * Q = ggml_cont(c, ggml_permute(c, ggml_reshape_3d(c, ggml_cont(c, q), DK, H, T), 0, 2, 1, 3)); // [DK, T, H]
+    ggml_tensor * K = ggml_cont(c, ggml_permute(c, ggml_reshape_3d(c, ggml_cont(c, k), DK, H, T), 0, 2, 1, 3)); // [DK, T, H]
+    ggml_tensor * Vt = ggml_cont(c, ggml_permute(c, ggml_reshape_3d(c, ggml_cont(c, v), DV, H, T), 1, 2, 0, 3)); // [T, DV, H]
+    ggml_tensor * it = ggml_cont(c, ggml_transpose(c, ig)); // [T, H]
+    ggml_tensor * ft = ggml_cont(c, ggml_transpose(c, fg)); // [T, H]
+
+    // F_t = sum_{u <= t} log sigmoid(f_u);  log D[s, t] = F_t - F_s + i_s for s <= t
+    ggml_tensor * F  = ggml_cumsum(c, ggml_neg(c, ggml_softplus(c, ggml_neg(c, ft)))); // [T, H]
+    ggml_tensor * Bs = ggml_reshape_3d(c, ggml_sub(c, it, F), T, 1, H); // s on ne0
+    ggml_tensor * At = ggml_reshape_3d(c, F, 1, T, H);                  // t on ne1
+    ggml_tensor * lD = ggml_add(c, ggml_repeat_4d(c, Bs, T, T, H, 1), At);
+    lD = ggml_tri(c, lD, GGML_TRI_TYPE_LOWER_DIAG); // s > t would overflow exp: zero first, mask again after
+    ggml_tensor * Dm = ggml_tri(c, ggml_exp(c, lD), GGML_TRI_TYPE_LOWER_DIAG); // [T_s, T_t, H]
+
+    ggml_tensor * S = ggml_mul(c, ggml_scale(c, ggml_mul_mat(c, K, Q), scale), Dm); // [T_s, T_t, H]
+    ggml_tensor * num = ggml_mul_mat(c, Vt, S);                                    // [DV, T_t, H]
+    ggml_tensor * h = ggml_div(c, num, denom(ggml_sum_rows(c, S)));                // [DV, T, H]
+
+    // state after the last position: weights w_s = D[s, T-1]
+    ggml_tensor * w  = ggml_view_3d(c, Dm, T, 1, H, Dm->nb[1], Dm->nb[2], (T - 1)*Dm->nb[1]);
+    ggml_tensor * Kw = ggml_mul(c, K, ggml_reshape_3d(c, ggml_cont(c, w), 1, T, H)); // [DK, T, H]
+    ggml_tensor * KwT = ggml_cont(c, ggml_transpose(c, Kw));                        // [T, DK, H]
+    ggml_build_forward_expand(gf_cur, ggml_cpy(c, ggml_mul_mat(c, KwT, Vt), state_c[il]));
+    ggml_build_forward_expand(gf_cur, ggml_cpy(c, ggml_reshape_3d(c, ggml_sum_rows(c, KwT), DK, 1, H), state_n[il]));
+
+    return ggml_cont(c, ggml_permute(c, h, 0, 2, 1, 3)); // [DV, H, T]
+}
+
 ggml_tensor * llama_bolmo::build_local_layer(ggml_context * c, ggml_tensor * x, int il) {
     const auto & L = m->local[il];
     const int64_t T = x->ne[1];
@@ -230,15 +238,7 @@ ggml_tensor * llama_bolmo::build_local_layer(ggml_context * c, ggml_tensor * x, 
     ggml_tensor * ig = soft_cap(ggml_add(c, ggml_mul_mat(c, L.wi_gate, xn), L.bi_gate));
     ggml_tensor * fg = soft_cap(ggml_add(c, ggml_mul_mat(c, L.wf_gate, xn), L.bf_gate));
 
-    ggml_tensor * args[6] = {
-        ggml_reshape_3d(c, ggml_cont(c, q), DK, H, T),
-        ggml_reshape_3d(c, ggml_cont(c, k), DK, H, T),
-        ggml_reshape_3d(c, ggml_cont(c, v), DV, H, T),
-        ggml_cont(c, ig),
-        ggml_cont(c, fg),
-        states[il],
-    };
-    ggml_tensor * h = ggml_custom_4d(c, GGML_TYPE_F32, DV, H, T, 1, args, 6, bolmo_mlstm_op, (int) H, (void *) const_cast<float *>(&m->mlstm_norm_eps));
+    ggml_tensor * h = build_mlstm(c, q, k, v, ig, fg, il); // [DV, H, T]
 
     // MultiHeadLayerNorm: a LayerNorm over each head, weight over all heads, no bias
     h = ggml_norm(c, h, m->mlstm_norm_eps);
@@ -262,7 +262,12 @@ bool llama_bolmo::compute(ggml_cgraph * gf) {
             fn(b, n_threads);
         }
     }
-    return ggml_backend_sched_graph_compute(sched, gf) == GGML_STATUS_SUCCESS;
+    const bool ok = ggml_backend_sched_graph_compute(sched, gf) == GGML_STATUS_SUCCESS;
+    static const bool dbg = getenv("LLAMA_BOLMO_DEBUG") != nullptr;
+    if (dbg) {
+        LLAMA_LOG_INFO("%s: %d nodes, %d splits\n", __func__, ggml_graph_n_nodes(gf), ggml_backend_sched_get_n_splits(sched));
+    }
+    return ok;
 }
 
 static void set_i32(ggml_tensor * t, const int32_t * v) {
@@ -273,6 +278,7 @@ bool llama_bolmo::run_encoder(const int32_t * ids, const int32_t * sub, int32_t 
                               std::vector<float> & enc_h, std::vector<float> * bq, std::vector<float> * bk) {
     ggml_context * c = new_graph_ctx();
     ggml_cgraph * gf = ggml_new_graph_custom(c, 4096, false);
+    gf_cur = gf;
 
     ggml_tensor * t_ids = ggml_new_tensor_1d(c, GGML_TYPE_I32, T);
     ggml_set_input(t_ids);
@@ -385,6 +391,7 @@ bool llama_bolmo::run_decoder(const float * enc_h, int32_t T, const float * glob
                               bool last_only, float * logits) {
     ggml_context * c = new_graph_ctx();
     ggml_cgraph * gf = ggml_new_graph_custom(c, 4096, false);
+    gf_cur = gf;
 
     ggml_tensor * eh = ggml_new_tensor_2d(c, GGML_TYPE_F32, D, T);
     ggml_set_input(eh);
@@ -423,7 +430,9 @@ bool llama_bolmo::run_decoder(const float * enc_h, int32_t T, const float * glob
 
 void llama_bolmo::reset() {
     llama_memory_clear(llama_get_memory(ctx), true);
-    ggml_backend_buffer_clear(buf_state, 0);
+    for (auto * buf : buf_state) {
+        ggml_backend_buffer_clear(buf, 0);
+    }
     hist.clear();
     n_patches = 0;
     last_glob.assign(D, 0.0f);
@@ -510,16 +519,31 @@ llama_bolmo * llama_bolmo_init(llama_context * ctx) {
 
     b->meta.resize(ggml_tensor_overhead()*8192 + ggml_graph_overhead_custom(8192, false));
 
-    // mLSTM states in host memory
+    // mLSTM states, each in a plain buffer of the device that holds its layer's weights
     const size_t n_local = bm->local.size();
-    ggml_init_params ps = { ggml_tensor_overhead()*(n_local + 1), nullptr, true };
+    ggml_init_params ps = { ggml_tensor_overhead()*2*(n_local + 1), nullptr, true };
     b->ctx_state = ggml_init(ps);
     for (size_t i = 0; i < n_local; ++i) {
-        ggml_tensor * s = ggml_new_tensor_1d(b->ctx_state, GGML_TYPE_F32, b->H*(b->DK*b->DV + b->DK + 1));
-        ggml_format_name(s, "bolmo_mlstm_state_%zu", i);
-        b->states.push_back(s);
+        ggml_tensor * sc = ggml_new_tensor_3d(b->ctx_state, GGML_TYPE_F32, b->DK, b->DV, b->H);
+        ggml_tensor * sn = ggml_new_tensor_3d(b->ctx_state, GGML_TYPE_F32, b->DK, 1, b->H);
+        ggml_format_name(sc, "bolmo_mlstm_c_%zu", i);
+        ggml_format_name(sn, "bolmo_mlstm_n_%zu", i);
+        b->state_c.push_back(sc);
+        b->state_n.push_back(sn);
+
+        ggml_backend_buffer_t wbuf = bm->local[i].wq->buffer;
+        ggml_backend_dev_t dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(wbuf));
+        if (!dev || ggml_backend_buffer_is_host(wbuf)) {
+            dev = ggml_backend_get_device(cpu);
+        }
+        ggml_backend_buffer_type_t buft = ggml_backend_dev_buffer_type(dev);
+        const size_t sz = ggml_backend_buft_get_alloc_size(buft, sc) + ggml_backend_buft_get_alloc_size(buft, sn) + 2*ggml_backend_buft_get_alignment(buft);
+        ggml_backend_buffer_t buf = ggml_backend_buft_alloc_buffer(buft, sz);
+        ggml_tallocr ta = ggml_tallocr_new(buf);
+        ggml_tallocr_alloc(&ta, sc);
+        ggml_tallocr_alloc(&ta, sn);
+        b->buf_state.push_back(buf);
     }
-    b->buf_state = ggml_backend_alloc_ctx_tensors_from_buft(b->ctx_state, ggml_backend_dev_buffer_type(ggml_backend_get_device(cpu)));
 
     b->trie.build(bm->expand_table);
     b->reset();

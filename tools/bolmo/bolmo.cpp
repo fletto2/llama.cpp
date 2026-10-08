@@ -5,6 +5,13 @@
 //              per-byte NLL marginalised over the boundary flag, as bits/byte
 //   dump:      llama-bolmo -m model.gguf -p "text" --dump-logits out.bin
 //              n x 520 float32 logits of the teacher-forced forward, then n int8 boundary flags
+//   mcq:       llama-bolmo -m model.gguf --mcq items.tsv out.tsv [--mcq-tf]
+//              items: cat, stem, correct, wrong1..3 (header line first), as llm_score mcq. For every option,
+//              the log-probability of the bytes of " <option>" after the stem. Default: causal, as in generation
+//              (prefill the stem, then step through the option bytes; each byte ends a patch when the model
+//              prefers its fused id). --mcq-tf: the teacher-forced forward over "<stem> <option>" instead, whose
+//              boundaries use one byte of lookahead into the option.
+//              out: item, option (0 = correct), n_bytes, n_bytes, logprob
 
 #include "llama.h"
 #include "llama-bolmo.h"
@@ -22,7 +29,7 @@
 static void usage(const char * argv0) {
     fprintf(stderr,
         "usage: %s -m model.gguf [-p prompt | -f prompt.txt] [-n n_bytes] [--temp T] [--seed S]\n"
-        "       [--score-file text.txt] [--chunk n_bytes] [--dump-logits out.bin]\n"
+        "       [--score-file text.txt] [--chunk n_bytes] [--dump-logits out.bin] [--mcq items.tsv out.tsv [--mcq-tf]]\n"
         "       [-ngl n] [-t threads] [-c n_ctx_patches] [-b n_batch] [--show-patches]\n", argv0);
 }
 
@@ -51,7 +58,8 @@ static double nll_byte(const float * lg, int n_vocab, int32_t id, int32_t boff) 
 }
 
 int main(int argc, char ** argv) {
-    std::string model_path, prompt, score_file, dump_path;
+    std::string model_path, prompt, score_file, dump_path, mcq_in, mcq_out;
+    bool mcq_tf = false;
     int n_predict = 128, ngl = 0, n_threads = 8, n_ctx = 4096, n_batch = 512, chunk = 2048;
     float temp = 0.0f;
     unsigned seed = 1;
@@ -77,6 +85,8 @@ int main(int argc, char ** argv) {
         else if (a == "--chunk") { chunk = std::stoi(next()); }
         else if (a == "--dump-logits") { dump_path = next(); }
         else if (a == "--show-patches") { show_patches = true; }
+        else if (a == "--mcq") { mcq_in = next(); mcq_out = next(); }
+        else if (a == "--mcq-tf") { mcq_tf = true; }
         else { usage(argv[0]); return 1; }
     }
     if (model_path.empty()) {
@@ -125,7 +135,69 @@ int main(int argc, char ** argv) {
 
     int ret = 0;
 
-    if (!score_file.empty()) {
+    if (!mcq_in.empty()) {
+        std::ifstream in(mcq_in);
+        FILE * out = fopen(mcq_out.c_str(), "w");
+        fprintf(out, "item\toption\tn_tokens\tn_bytes\tlogprob\n");
+        std::string line;
+        std::getline(in, line); // header
+        int item = 0;
+        std::vector<float> lg(n_vocab);
+        const auto t0 = ggml_time_us();
+        while (std::getline(in, line)) {
+            std::vector<std::string> f;
+            size_t p0 = 0;
+            for (size_t p; (p = line.find('\t', p0)) != std::string::npos; p0 = p + 1) {
+                f.push_back(line.substr(p0, p - p0));
+            }
+            f.push_back(line.substr(p0));
+            if (f.size() < 6) {
+                continue;
+            }
+            const std::string & stem = f[1];
+            const auto ids_stem = tokenize(stem);
+            for (int o = 0; o < 4; ++o) {
+                const std::string opt = " " + f[2 + o];
+                double lp = 0.0;
+                if (mcq_tf) {
+                    const auto ids = tokenize(stem + opt);
+                    const int n = (int) ids.size();
+                    std::vector<float> all((size_t) n*n_vocab);
+                    if (llama_bolmo_score(bolmo, ids.data(), n, all.data(), nullptr) < 0) {
+                        fprintf(stderr, "score failed\n");
+                        return 1;
+                    }
+                    for (int t = (int) ids_stem.size() - 1; t + 1 < n; ++t) {
+                        lp -= nll_byte(all.data() + (size_t) t*n_vocab, n_vocab, ids[t + 1], boff);
+                    }
+                } else {
+                    if (llama_bolmo_prefill(bolmo, ids_stem.data(), (int32_t) ids_stem.size(), lg.data()) < 0) {
+                        fprintf(stderr, "prefill failed\n");
+                        return 1;
+                    }
+                    for (size_t i = 0; i < opt.size(); ++i) {
+                        int32_t id = 0;
+                        llama_bolmo_tokenize(bolmo, opt.data() + i, 1, &id, 1, false);
+                        lp -= nll_byte(lg.data(), n_vocab, id, boff);
+                        if (i + 1 < opt.size()) {
+                            const int32_t tok = lg[id + boff] > lg[id] ? id + boff : id;
+                            if (llama_bolmo_step(bolmo, tok, lg.data()) != 0) {
+                                fprintf(stderr, "step failed\n");
+                                return 1;
+                            }
+                        }
+                    }
+                }
+                fprintf(out, "%d\t%d\t%zu\t%zu\t%.6f\n", item, o, opt.size(), opt.size(), lp);
+            }
+            item++;
+            if (item % 20 == 0) {
+                fprintf(stderr, "\r%d items (%.1f s)", item, (ggml_time_us() - t0) / 1e6);
+            }
+        }
+        fprintf(stderr, "\n");
+        fclose(out);
+    } else if (!score_file.empty()) {
         const std::string text = read_file(score_file);
         double nll = 0.0;
         long n_bytes = 0, n_patch = 0;
