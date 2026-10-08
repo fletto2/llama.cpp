@@ -143,6 +143,7 @@ int main(int argc, char ** argv) {
         std::getline(in, line); // header
         int item = 0;
         std::vector<float> lg(n_vocab);
+        const bool dbg = getenv("LLAMA_BOLMO_DEBUG") != nullptr;
         const auto t0 = ggml_time_us();
         while (std::getline(in, line)) {
             std::vector<std::string> f;
@@ -163,12 +164,17 @@ int main(int argc, char ** argv) {
                     const auto ids = tokenize(stem + opt);
                     const int n = (int) ids.size();
                     std::vector<float> all((size_t) n*n_vocab);
-                    if (llama_bolmo_score(bolmo, ids.data(), n, all.data(), nullptr) < 0) {
+                    std::vector<int8_t> bnd(n);
+                    if (llama_bolmo_score(bolmo, ids.data(), n, all.data(), bnd.data()) < 0) {
                         fprintf(stderr, "score failed\n");
                         return 1;
                     }
                     for (int t = (int) ids_stem.size() - 1; t + 1 < n; ++t) {
-                        lp -= nll_byte(all.data() + (size_t) t*n_vocab, n_vocab, ids[t + 1], boff);
+                        const double nb = nll_byte(all.data() + (size_t) t*n_vocab, n_vocab, ids[t + 1], boff);
+                        lp -= nb;
+                        if (dbg) {
+                            fprintf(stderr, "tf item %d opt %d byte '%c' nll %.4f bnd[t] %d\n", item, o, (char) llama_bolmo_id_to_byte(bolmo, ids[t + 1]), nb, bnd[t]);
+                        }
                     }
                 } else {
                     if (llama_bolmo_prefill(bolmo, ids_stem.data(), (int32_t) ids_stem.size(), lg.data()) < 0) {
@@ -178,7 +184,11 @@ int main(int argc, char ** argv) {
                     for (size_t i = 0; i < opt.size(); ++i) {
                         int32_t id = 0;
                         llama_bolmo_tokenize(bolmo, opt.data() + i, 1, &id, 1, false);
-                        lp -= nll_byte(lg.data(), n_vocab, id, boff);
+                        const double nb = nll_byte(lg.data(), n_vocab, id, boff);
+                        lp -= nb;
+                        if (dbg) {
+                            fprintf(stderr, "causal item %d opt %d byte '%c' nll %.4f fused %d\n", item, o, opt[i], nb, lg[id + boff] > lg[id]);
+                        }
                         if (i + 1 < opt.size()) {
                             const int32_t tok = lg[id + boff] > lg[id] ? id + boff : id;
                             if (llama_bolmo_step(bolmo, tok, lg.data()) != 0) {
