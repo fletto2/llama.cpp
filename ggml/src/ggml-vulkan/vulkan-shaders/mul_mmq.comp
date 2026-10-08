@@ -251,7 +251,10 @@ void main() {
         pos_a_ib += BK_STEP;
         pos_b_ib += BK_STEP;
 
-        for (uint k_step = 0; k_step < BK_STEP; k_step++) {
+        // Steps past end_k have no A block in shared memory (block_a_to_shmem is skipped for them), only a
+        // zeroed B block; computing them multiplies stale A data by zero, which is NaN when a stale scale is
+        // inf/NaN (seen on V3D, where shared memory keeps earlier contents). The bound is uniform per workgroup.
+        for (uint k_step = 0; k_step < BK_STEP && block + k_step * BK < end_k; k_step++) {
             // Load from shared into cache
             [[unroll]] for (uint wsir = 0; wsir < WMITER; wsir++) {
                 [[unroll]] for (uint cr = 0; cr < TM; cr++) {
