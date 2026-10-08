@@ -36,6 +36,7 @@ TEXT_MODEL_MAP: dict[str, str] = {
     "BitnetForCausalLM": "bitnet",
     "BitNetForCausalLM": "bitnet",
     "BloomForCausalLM": "bloom",
+    "BolmoForCausalLM": "bolmo",
     "BloomModel": "bloom",
     "CamembertModel": "bert",
     "ChameleonForCausalLM": "chameleon",

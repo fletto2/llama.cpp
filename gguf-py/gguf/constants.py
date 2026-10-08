@@ -662,6 +662,7 @@ class MODEL_ARCH(IntEnum):
     QWEN3TTS         = auto()
     POCKETTTS        = auto()
     K2HORIZON        = auto()
+    BOLMO            = auto()
 
 
 class VISION_PROJECTOR_TYPE(IntEnum):
@@ -1287,6 +1288,27 @@ class MODEL_TENSOR(IntEnum):
     A_QF_FFN_UP            = auto()
     A_QF_FFN_DOWN          = auto()
     A_QF_FFN_NORM          = auto()
+    BOLMO_BYTE_EMBD        = auto()
+    BOLMO_SUBWORD_EMBD     = auto()
+    BOLMO_XLSTM_NORM       = auto()
+    BOLMO_MLSTM_Q          = auto()
+    BOLMO_MLSTM_K          = auto()
+    BOLMO_MLSTM_V          = auto()
+    BOLMO_MLSTM_OGATE      = auto()
+    BOLMO_MLSTM_IGATE      = auto()
+    BOLMO_MLSTM_FGATE      = auto()
+    BOLMO_MLSTM_HNORM      = auto()
+    BOLMO_MLSTM_OUT        = auto()
+    BOLMO_LFFN_NORM        = auto()
+    BOLMO_LFFN_GATE        = auto()
+    BOLMO_LFFN_UP          = auto()
+    BOLMO_LFFN_DOWN        = auto()
+    BOLMO_ENC_OUT_NORM     = auto()
+    BOLMO_ENC_OUT_PROJ     = auto()
+    BOLMO_BND_Q            = auto()
+    BOLMO_BND_K            = auto()
+    BOLMO_DEC_IN_NORM      = auto()
+    BOLMO_DEC_IN_PROJ      = auto()
 
 
 MODEL_ARCH_NAMES: dict[MODEL_ARCH, str] = {
@@ -1446,6 +1468,7 @@ MODEL_ARCH_NAMES: dict[MODEL_ARCH, str] = {
     MODEL_ARCH.QWEN3TTS:         "qwen3tts",
     MODEL_ARCH.POCKETTTS:        "pockettts",
     MODEL_ARCH.K2HORIZON:        "k2-horizon",
+    MODEL_ARCH.BOLMO:            "bolmo",
 }
 
 VISION_PROJECTOR_TYPE_NAMES: dict[VISION_PROJECTOR_TYPE, str] = {
@@ -2063,6 +2086,27 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.D2T:                       "d2t",
     MODEL_TENSOR.ATTN_V_GATE:               "blk.{bid}.attn_v_gate",
     MODEL_TENSOR.ATTN_V_EXP:                "blk.{bid}.attn_v_exps",
+    MODEL_TENSOR.BOLMO_BYTE_EMBD:                "byte_embd",
+    MODEL_TENSOR.BOLMO_SUBWORD_EMBD:             "subword_embd",
+    MODEL_TENSOR.BOLMO_XLSTM_NORM:               "local.{bid}.xlstm_norm",
+    MODEL_TENSOR.BOLMO_MLSTM_Q:                  "local.{bid}.mlstm_q",
+    MODEL_TENSOR.BOLMO_MLSTM_K:                  "local.{bid}.mlstm_k",
+    MODEL_TENSOR.BOLMO_MLSTM_V:                  "local.{bid}.mlstm_v",
+    MODEL_TENSOR.BOLMO_MLSTM_OGATE:              "local.{bid}.mlstm_ogate",
+    MODEL_TENSOR.BOLMO_MLSTM_IGATE:              "local.{bid}.mlstm_igate",
+    MODEL_TENSOR.BOLMO_MLSTM_FGATE:              "local.{bid}.mlstm_fgate",
+    MODEL_TENSOR.BOLMO_MLSTM_HNORM:              "local.{bid}.mlstm_hnorm",
+    MODEL_TENSOR.BOLMO_MLSTM_OUT:                "local.{bid}.mlstm_out",
+    MODEL_TENSOR.BOLMO_LFFN_NORM:                "local.{bid}.ffn_norm",
+    MODEL_TENSOR.BOLMO_LFFN_GATE:                "local.{bid}.ffn_gate",
+    MODEL_TENSOR.BOLMO_LFFN_UP:                  "local.{bid}.ffn_up",
+    MODEL_TENSOR.BOLMO_LFFN_DOWN:                "local.{bid}.ffn_down",
+    MODEL_TENSOR.BOLMO_ENC_OUT_NORM:             "enc_out_norm",
+    MODEL_TENSOR.BOLMO_ENC_OUT_PROJ:             "enc_out_proj",
+    MODEL_TENSOR.BOLMO_BND_Q:                    "bnd_q",
+    MODEL_TENSOR.BOLMO_BND_K:                    "bnd_k",
+    MODEL_TENSOR.BOLMO_DEC_IN_NORM:              "dec_in_norm",
+    MODEL_TENSOR.BOLMO_DEC_IN_PROJ:              "dec_in_proj",
 }
 
 MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
@@ -5828,6 +5872,44 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.FFN_GATE_SHEXP,
         MODEL_TENSOR.FFN_UP_SHEXP,
         MODEL_TENSOR.FFN_DOWN_SHEXP,
+    ],
+    MODEL_ARCH.BOLMO: [
+        MODEL_TENSOR.OUTPUT_NORM,
+        MODEL_TENSOR.OUTPUT,
+        MODEL_TENSOR.ATTN_NORM,
+        MODEL_TENSOR.ATTN_Q,
+        MODEL_TENSOR.ATTN_Q_NORM,
+        MODEL_TENSOR.ATTN_K,
+        MODEL_TENSOR.ATTN_K_NORM,
+        MODEL_TENSOR.ATTN_V,
+        MODEL_TENSOR.ATTN_OUT,
+        MODEL_TENSOR.ATTN_POST_NORM,
+        MODEL_TENSOR.FFN_NORM,
+        MODEL_TENSOR.FFN_GATE,
+        MODEL_TENSOR.FFN_DOWN,
+        MODEL_TENSOR.FFN_UP,
+        MODEL_TENSOR.FFN_POST_NORM,
+        MODEL_TENSOR.BOLMO_BYTE_EMBD,
+        MODEL_TENSOR.BOLMO_SUBWORD_EMBD,
+        MODEL_TENSOR.BOLMO_XLSTM_NORM,
+        MODEL_TENSOR.BOLMO_MLSTM_Q,
+        MODEL_TENSOR.BOLMO_MLSTM_K,
+        MODEL_TENSOR.BOLMO_MLSTM_V,
+        MODEL_TENSOR.BOLMO_MLSTM_OGATE,
+        MODEL_TENSOR.BOLMO_MLSTM_IGATE,
+        MODEL_TENSOR.BOLMO_MLSTM_FGATE,
+        MODEL_TENSOR.BOLMO_MLSTM_HNORM,
+        MODEL_TENSOR.BOLMO_MLSTM_OUT,
+        MODEL_TENSOR.BOLMO_LFFN_NORM,
+        MODEL_TENSOR.BOLMO_LFFN_GATE,
+        MODEL_TENSOR.BOLMO_LFFN_UP,
+        MODEL_TENSOR.BOLMO_LFFN_DOWN,
+        MODEL_TENSOR.BOLMO_ENC_OUT_NORM,
+        MODEL_TENSOR.BOLMO_ENC_OUT_PROJ,
+        MODEL_TENSOR.BOLMO_BND_Q,
+        MODEL_TENSOR.BOLMO_BND_K,
+        MODEL_TENSOR.BOLMO_DEC_IN_NORM,
+        MODEL_TENSOR.BOLMO_DEC_IN_PROJ,
     ],
 }
 

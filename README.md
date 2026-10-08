@@ -7,6 +7,7 @@ This is [llama.cpp](https://github.com/ggml-org/llama.cpp) plus a few small patc
 - **Classifier heads** on the hidden states of the loaded model: yes/no (`noul`), multiple-choice (`choice`) and ordinal (`score`) questions. `llama-classifier` extracts features and trains heads. llama-server answers with them (`POST /classify`), returns pooled hidden states (`POST /features`) and trains new heads live (`POST /classify/train`).
 - **llama-server LoRA training** on the loaded model between requests (`--lora-train`, `POST /lora/train`).
 - **CPU + integrated GPU co-processing** of Q4_0 matrix products for prompt processing on boards whose GPU shares memory with the CPU (`GGML_CPU_COPROC_VULKAN`).
+- **Bolmo / Bwen byte-level models** (arch `bolmo`): conversion, quantization and `llama-bolmo` for generation and per-byte scoring.
 
 Everything else is unchanged upstream code. For building, models, tools and the full documentation, see the [official llama.cpp README](https://github.com/ggml-org/llama.cpp/blob/master/README.md).
 
@@ -175,3 +176,15 @@ On a board whose integrated GPU shares memory with the CPU, the GPU can compute 
 
 Measured with Qwen3-1.7B Q4_0, 4 threads, prompt 512 tokens, on a 4-core single-board computer whose integrated GPU uses the Mesa v3dv driver, no fan: 92.0 tok/s on the CPU alone, 104.5 tok/s with `GGML_CPU_COPROC=0.3` (+13.5%); perplexity unchanged within its error. That driver needs a fix to run compute workgroups concurrently: Mesa leaves the dispatch's maximum supergroup ID at 0, so its workgroups run one at a time and the GPU is about 4x slower.
 
+
+## Bolmo / Bwen byte-level models (arch `bolmo`)
+
+[Bolmo](https://huggingface.co/allenai/Bolmo-1B) and Bwen (Minixhofer et al., Nature 2026) turn a subword LLM into a byte-level one. The subword transformer becomes the "global" model over patches. Around it: a one-layer mLSTM encoder over bytes (byte embedding plus the embedding of the longest subword ending at each byte), a boundary predictor with one byte of lookahead, last-byte pooling into patches, and a four-layer mLSTM decoder with a 520-way head (byte, or byte with a fused patch boundary).
+
+- `convert_hf_to_gguf.py` converts `BolmoForCausalLM` checkpoints (OLMo 2 global blocks for Bolmo-1B/7B, Qwen 3 / Llama 3 pre-norm blocks for Bwen-8B). It needs the source subword tokenizer (`original_identifier` in the config) to store the suffix table; `BOLMO_SUBWORD_TOKENIZER=<path>` points to a local copy. `llama-quantize` works as usual.
+- `llama_decode` on a bolmo context runs only the global transformer: the batch carries patch embeddings, and the context returns the decoder's normalised input per patch as embeddings (`embeddings = true`, pooling none).
+- `include/llama-bolmo.h` runs the whole model: `llama_bolmo_prefill` / `llama_bolmo_step` follow `BolmoForCausalLM.generate()` (the prompt's last byte is force-decoded to decide whether it ends a patch; the global model steps only when a byte ends a patch), and `llama_bolmo_score` is the teacher-forced forward.
+- `llama-bolmo -m model.gguf -p "..." [-n N] [--temp T] [--show-patches]` generates; `--score-file text.txt` prints the per-byte NLL (marginalised over the boundary flag) as bits/byte; `--dump-logits` writes the teacher-forced logits and boundaries.
+- The mLSTM recurrence (stabilised, as the `mlstm_kernels` native step) is a CPU custom op; the other local-layer ops and the global model run on the GPU with `-ngl`. One sequence at a time.
+
+Checked against the Hugging Face implementation (transformers 4.57.3, xlstm 2.0.4, CPU fp32) on four prompts (English, x86 assembly, Python): Bolmo-1B F32 and Bwen-8B F16 GGUFs give the same patch boundaries, a 520-way softmax within KL 4e-6 at every byte (2.4e-5 with CUDA), and byte-identical greedy generations (51 to 91 bytes). Bolmo-1B Q8_0 on an RTX 5090: 660 bytes/s greedy generation.

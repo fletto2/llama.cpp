@@ -2890,3 +2890,68 @@ struct llama_model_k2_horizon : public llama_model_base {
 
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
 };
+
+// Bolmo / Bwen: byte-level models built around a subword transformer (allenai/bolmo-core).
+// llama_decode runs the global transformer only: the batch carries patch embeddings
+// (batch.embd) and the output embeddings are the decoder's initial_norm of the global output.
+// The local mLSTM encoder/decoder, the boundary predictor and the byte loop are in
+// llama-bolmo.cpp (llama_bolmo_* API).
+struct llama_model_bolmo : public llama_model_base {
+    llama_model_bolmo(const struct llama_model_params & params) : llama_model_base(params) {}
+    void load_arch_hparams(llama_model_loader & ml) override;
+    void load_arch_tensors(llama_model_loader & ml) override;
+
+    struct local_layer {
+        ggml_tensor * xlstm_norm = nullptr;
+        ggml_tensor * wq = nullptr;
+        ggml_tensor * wk = nullptr;
+        ggml_tensor * wv = nullptr;
+        ggml_tensor * wo_gate = nullptr;
+        ggml_tensor * wi_gate = nullptr;
+        ggml_tensor * bi_gate = nullptr;
+        ggml_tensor * wf_gate = nullptr;
+        ggml_tensor * bf_gate = nullptr;
+        ggml_tensor * h_norm = nullptr;
+        ggml_tensor * w_out = nullptr;
+        ggml_tensor * ffn_norm = nullptr;
+        ggml_tensor * ffn_gate = nullptr;
+        ggml_tensor * ffn_up = nullptr;
+        ggml_tensor * ffn_down = nullptr;
+    };
+
+    // hyperparameters of the local model and the byte vocabulary
+    bool     reordered_norm = true;
+    bool     use_qk_norm    = true;
+    bool     head_qk_norm   = false;
+    uint32_t n_local_head   = 16;
+    uint32_t n_local_ff     = 0;
+    float    local_eps      = 1e-5f;
+    uint32_t n_enc_layer    = 1;
+    uint32_t n_dec_layer    = 4;
+    uint32_t lookahead      = 1;
+    uint32_t n_subword      = 0;
+    float    qk_dim_factor  = 0.5f;
+    float    v_dim_factor   = 1.0f;
+    float    gate_soft_cap  = 15.0f;
+    float    mlstm_norm_eps = 1e-6f;
+    int32_t  tok_bos = 1, tok_eos = 1, tok_pad = 0, tok_bpe_end = 3, tok_offset = 4;
+    std::vector<int32_t> expand_table; // (subword id, n, byte ids...) per entry, in vocabulary order
+
+    ggml_tensor * byte_embd    = nullptr;
+    ggml_tensor * subword_embd = nullptr;
+    ggml_tensor * enc_out_norm = nullptr;
+    ggml_tensor * enc_out_w    = nullptr;
+    ggml_tensor * enc_out_b    = nullptr;
+    ggml_tensor * bnd_q        = nullptr;
+    ggml_tensor * bnd_k        = nullptr;
+    ggml_tensor * dec_in_norm  = nullptr;
+    ggml_tensor * dec_in_w     = nullptr;
+    ggml_tensor * dec_in_b     = nullptr;
+    std::vector<local_layer> local; // encoder layers, then decoder layers
+
+    struct graph : public llm_graph_context {
+        graph(const llama_model & model, const llm_graph_params & params);
+    };
+
+    std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
+};
