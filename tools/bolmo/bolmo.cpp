@@ -5,6 +5,10 @@
 //              per-byte NLL marginalised over the boundary flag, as bits/byte
 //   dump:      llama-bolmo -m model.gguf -p "text" --dump-logits out.bin
 //              n x 520 float32 logits of the teacher-forced forward, then n int8 boundary flags
+//   server:    llama-bolmo -m model.gguf --server [--host 127.0.0.1] [--port 8090]
+//              POST /v1/completions {"prompt", "max_tokens" (bytes, default 256), "temperature" (0 = greedy),
+//              "seed", "stop": [strings]} -> {"choices": [{"text", "finish_reason"}], "usage"}; POST /score {"text"}
+//              -> {"bytes", "patches", "nll_per_byte", "bits_per_byte"}; GET /health. One request at a time.
 //   mcq:       llama-bolmo -m model.gguf --mcq items.tsv out.tsv [--mcq-tf]
 //              items: cat, stem, correct, wrong1..3 (header line first), as llm_score mcq. For every option,
 //              the log-probability of the bytes of " <option>" after the stem. Default: causal, as in generation
@@ -18,6 +22,10 @@
 
 #include "llama.h"
 #include "llama-bolmo.h"
+
+#include <cpp-httplib/httplib.h>
+#include <nlohmann/json.hpp>
+#include <mutex>
 
 #include <cmath>
 #include <cstdio>
@@ -140,7 +148,9 @@ static void bolmo_marginal(marg_ctx & m, size_t i, const std::vector<float> & lg
 
 int main(int argc, char ** argv) {
     std::string model_path, prompt, score_file, dump_path, mcq_in, mcq_out;
-    bool mcq_tf = false, mcq_exact = false, test_snapshot = false;
+    bool mcq_tf = false, mcq_exact = false, test_snapshot = false, server = false;
+    std::string host = "127.0.0.1";
+    int port = 8090;
     double mcq_tau = 1e-3;
     int n_predict = 128, ngl = 0, n_threads = 8, n_ctx = 4096, n_batch = 512, chunk = 2048;
     float temp = 0.0f;
@@ -171,6 +181,9 @@ int main(int argc, char ** argv) {
         else if (a == "--mcq-tf") { mcq_tf = true; }
         else if (a == "--mcq-exact") { mcq_exact = true; }
         else if (a == "--test-snapshot") { test_snapshot = true; }
+        else if (a == "--server") { server = true; }
+        else if (a == "--host") { host = next(); }
+        else if (a == "--port") { port = std::stoi(next()); }
         else if (a == "--mcq-tau") { mcq_tau = std::stod(next()); }
         else { usage(argv[0]); return 1; }
     }
@@ -220,7 +233,97 @@ int main(int argc, char ** argv) {
 
     int ret = 0;
 
-    if (test_snapshot) {
+    if (server) {
+        using json = nlohmann::json;
+        std::mutex mu;
+        httplib::Server srv;
+        auto sample = [&](const std::vector<float> & lg, float t, std::mt19937 & rng) {
+            int32_t tok = 0;
+            if (t <= 0.0f) {
+                for (int i = 1; i < n_vocab; ++i) {
+                    if (lg[i] > lg[tok]) {
+                        tok = i;
+                    }
+                }
+                return tok;
+            }
+            float mx = lg[0];
+            for (int i = 1; i < n_vocab; ++i) mx = std::max(mx, lg[i]);
+            std::vector<double> p(n_vocab);
+            for (int i = 0; i < n_vocab; ++i) p[i] = std::exp((lg[i] - mx) / t);
+            std::discrete_distribution<int> d(p.begin(), p.end());
+            return (int32_t) d(rng);
+        };
+        srv.Get("/health", [](const httplib::Request &, httplib::Response & res) {
+            res.set_content("{\"status\":\"ok\"}", "application/json");
+        });
+        srv.Post("/v1/completions", [&](const httplib::Request & req, httplib::Response & res) {
+            json in;
+            try { in = json::parse(req.body); } catch (...) { res.status = 400; return; }
+            const std::string p = in.value("prompt", std::string());
+            const int n_max = in.value("max_tokens", 256);
+            const float t = in.value("temperature", 0.0f);
+            std::mt19937 rng(in.value("seed", 1u));
+            std::vector<std::string> stops;
+            if (in.contains("stop")) {
+                if (in["stop"].is_string()) stops.push_back(in["stop"]);
+                else for (auto & x : in["stop"]) stops.push_back(x);
+            }
+            std::lock_guard<std::mutex> lock(mu);
+            const auto ids = tokenize(p);
+            std::vector<float> lg(n_vocab);
+            json out;
+            if (ids.size() < 2 || llama_bolmo_prefill(bolmo, ids.data(), (int32_t) ids.size(), lg.data()) < 0) {
+                res.status = 500;
+                res.set_content("{\"error\":\"prefill failed (the prompt needs at least one byte)\"}", "application/json");
+                return;
+            }
+            std::string text;
+            std::string reason = "length";
+            for (int g = 0; g < n_max; ++g) {
+                const int32_t tok = sample(lg, t, rng);
+                if (tok == eos || tok == eos + boff) { reason = "stop"; break; }
+                const int32_t byte = llama_bolmo_id_to_byte(bolmo, tok);
+                if (byte < 0) { reason = "stop"; break; }
+                text.push_back((char) byte);
+                bool hit = false;
+                for (auto & st : stops) {
+                    if (!st.empty() && text.size() >= st.size() && text.compare(text.size() - st.size(), st.size(), st) == 0) {
+                        text.resize(text.size() - st.size());
+                        hit = true;
+                    }
+                }
+                if (hit) { reason = "stop"; break; }
+                if (llama_bolmo_step(bolmo, tok, lg.data()) != 0) { reason = "error"; break; }
+            }
+            out["object"] = "text_completion";
+            out["choices"] = json::array({ json{{"index", 0}, {"text", text}, {"finish_reason", reason}} });
+            out["usage"] = json{{"prompt_bytes", (int) p.size()}, {"completion_bytes", (int) text.size()},
+                                {"patches", llama_bolmo_n_patches(bolmo)}};
+            res.set_content(out.dump(-1, ' ', false, json::error_handler_t::replace), "application/json");
+        });
+        srv.Post("/score", [&](const httplib::Request & req, httplib::Response & res) {
+            json in;
+            try { in = json::parse(req.body); } catch (...) { res.status = 400; return; }
+            const std::string txt = in.value("text", std::string());
+            std::lock_guard<std::mutex> lock(mu);
+            const auto ids = tokenize(txt);
+            const int n = (int) ids.size();
+            std::vector<float> all((size_t) n*n_vocab);
+            const int P = llama_bolmo_score(bolmo, ids.data(), n, all.data(), nullptr);
+            if (P < 0) { res.status = 500; return; }
+            double nll = 0;
+            for (int i = 0; i + 1 < n; ++i) nll += nll_byte(all.data() + (size_t) i*n_vocab, n_vocab, ids[i + 1], boff);
+            const int nb = std::max(1, n - 1);
+            json out{{"bytes", n - 1}, {"patches", P}, {"nll_per_byte", nll / nb}, {"bits_per_byte", nll / nb / M_LN2}};
+            res.set_content(out.dump(), "application/json");
+        });
+        fprintf(stderr, "llama-bolmo: listening on http://%s:%d\n", host.c_str(), port);
+        if (!srv.listen(host, port)) {
+            fprintf(stderr, "cannot listen on %s:%d\n", host.c_str(), port);
+            ret = 1;
+        }
+    } else if (test_snapshot) {
         // snapshot, run 8 bytes (each fused, so the global model steps too), restore, run them again: same logits
         const auto ids = tokenize(prompt);
         std::vector<float> lg(n_vocab), a(n_vocab), bb(n_vocab);
