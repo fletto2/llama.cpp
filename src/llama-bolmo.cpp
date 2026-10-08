@@ -628,6 +628,10 @@ int32_t llama_bolmo_score(llama_bolmo * b, const int32_t * ids, int32_t n, float
 }
 
 int32_t llama_bolmo_prefill(llama_bolmo * b, const int32_t * ids, int32_t n, float * logits) {
+    return llama_bolmo_prefill_ext(b, ids, n, logits, true);
+}
+
+int32_t llama_bolmo_prefill_ext(llama_bolmo * b, const int32_t * ids, int32_t n, float * logits, bool decide_last) {
     if (n < 2) {
         return -1;
     }
@@ -663,6 +667,12 @@ int32_t llama_bolmo_prefill(llama_bolmo * b, const int32_t * ids, int32_t n, flo
     b->last_glob.assign(glob.end() - b->D, glob.end());
     b->pending_enc.assign(enc_h.end() - b->D, enc_h.end());
     b->has_pending = true;
+
+    if (!decide_last) {
+        // the caller decides whether the last prompt byte ends a patch: llama_bolmo_step(ids[n-1] or its fused id)
+        memcpy(logits, lg.data(), sizeof(float)*b->n_vocab);
+        return P;
+    }
 
     // forced decoding of the last prompt byte: only its plain and fused ids compete
     const int32_t x  = ids[n - 1];
@@ -710,4 +720,47 @@ int32_t llama_bolmo_step(llama_bolmo * b, int32_t token, float * logits) {
         return -4;
     }
     return 0;
+}
+
+struct llama_bolmo_snapshot {
+    std::vector<std::vector<uint8_t>> c, n;
+    std::vector<int32_t> hist;
+    int32_t n_patches = 0;
+    std::vector<float> last_glob, pending_enc;
+    bool has_pending = false;
+};
+
+llama_bolmo_snapshot * llama_bolmo_snapshot_take(const llama_bolmo * b) {
+    auto * s = new llama_bolmo_snapshot();
+    for (size_t i = 0; i < b->state_c.size(); ++i) {
+        s->c.emplace_back(ggml_nbytes(b->state_c[i]));
+        s->n.emplace_back(ggml_nbytes(b->state_n[i]));
+        ggml_backend_tensor_get(b->state_c[i], s->c.back().data(), 0, s->c.back().size());
+        ggml_backend_tensor_get(b->state_n[i], s->n.back().data(), 0, s->n.back().size());
+    }
+    s->hist        = b->hist;
+    s->n_patches   = b->n_patches;
+    s->last_glob   = b->last_glob;
+    s->pending_enc = b->pending_enc;
+    s->has_pending = b->has_pending;
+    return s;
+}
+
+void llama_bolmo_snapshot_restore(llama_bolmo * b, const llama_bolmo_snapshot * s) {
+    for (size_t i = 0; i < b->state_c.size(); ++i) {
+        ggml_backend_tensor_set(b->state_c[i], s->c[i].data(), 0, s->c[i].size());
+        ggml_backend_tensor_set(b->state_n[i], s->n[i].data(), 0, s->n[i].size());
+    }
+    if (b->n_patches > s->n_patches) {
+        llama_memory_seq_rm(llama_get_memory(b->ctx), 0, s->n_patches, -1);
+    }
+    b->hist        = s->hist;
+    b->n_patches   = s->n_patches;
+    b->last_glob   = s->last_glob;
+    b->pending_enc = s->pending_enc;
+    b->has_pending = s->has_pending;
+}
+
+void llama_bolmo_snapshot_free(llama_bolmo_snapshot * s) {
+    delete s;
 }

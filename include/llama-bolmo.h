@@ -52,8 +52,20 @@ extern "C" {
     // for the next one. Returns 0 on success.
     LLAMA_API int32_t llama_bolmo_step(struct llama_bolmo * bolmo, int32_t token, float * logits);
 
+    // As llama_bolmo_prefill, but with decide_last = false the logits are those that predict the prompt's last
+    // byte, and the caller feeds it with llama_bolmo_step (plain or fused id) to choose its boundary flag.
+    LLAMA_API int32_t llama_bolmo_prefill_ext(struct llama_bolmo * bolmo, const int32_t * ids, int32_t n, float * logits,
+                                              bool decide_last);
+
     // number of patches (global positions) in the current sequence
     LLAMA_API int32_t llama_bolmo_n_patches(const struct llama_bolmo * bolmo);
+
+    // Save and restore the sequence state (mLSTM states, the global KV cache length, the byte history), e.g. to
+    // explore both boundary choices of a byte. A snapshot restores a state with the same or fewer patches.
+    struct llama_bolmo_snapshot;
+    LLAMA_API struct llama_bolmo_snapshot * llama_bolmo_snapshot_take   (const struct llama_bolmo * bolmo);
+    LLAMA_API void                          llama_bolmo_snapshot_restore(struct llama_bolmo * bolmo, const struct llama_bolmo_snapshot * snap);
+    LLAMA_API void                          llama_bolmo_snapshot_free   (struct llama_bolmo_snapshot * snap);
 
 #ifdef __cplusplus
 }

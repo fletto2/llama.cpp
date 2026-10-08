@@ -11,6 +11,9 @@
 //              (prefill the stem, then step through the option bytes; each byte ends a patch when the model
 //              prefers its fused id). --mcq-tf: the teacher-forced forward over "<stem> <option>" instead, whose
 //              boundaries use one byte of lookahead into the option.
+//              --mcq-exact: the option's log-probability summed over both boundary choices at every byte (the
+//              stem's last byte included), depth-first with snapshots; choices below --mcq-tau (default 1e-3) of
+//              their byte's probability are skipped. Causal and teacher-forced scores bracket this one.
 //              out: item, option (0 = correct), n_bytes, n_bytes, logprob
 
 #include "llama.h"
@@ -29,7 +32,7 @@
 static void usage(const char * argv0) {
     fprintf(stderr,
         "usage: %s -m model.gguf [-p prompt | -f prompt.txt] [-n n_bytes] [--temp T] [--seed S]\n"
-        "       [--score-file text.txt] [--chunk n_bytes] [--dump-logits out.bin] [--mcq items.tsv out.tsv [--mcq-tf]]\n"
+        "       [--score-file text.txt] [--chunk n_bytes] [--dump-logits out.bin] [--mcq items.tsv out.tsv [--mcq-tf | --mcq-exact [--mcq-tau t]]]\n"
         "       [-ngl n] [-t threads] [-c n_ctx_patches] [-b n_batch] [--show-patches]\n", argv0);
 }
 
@@ -57,9 +60,88 @@ static double nll_byte(const float * lg, int n_vocab, int32_t id, int32_t boff) 
     return -std::log(p / z);
 }
 
+// log p(id) and log p(id + boundary) under the softmax of lg
+static void logp_pair(const float * lg, int n_vocab, int32_t id, int32_t boff, double & l0, double & l1) {
+    float mx = lg[0];
+    for (int i = 1; i < n_vocab; ++i) {
+        mx = std::max(mx, lg[i]);
+    }
+    double z = 0.0;
+    for (int i = 0; i < n_vocab; ++i) {
+        z += std::exp((double) lg[i] - mx);
+    }
+    l0 = (double) lg[id] - mx - std::log(z);
+    l1 = (double) lg[id + boff] - mx - std::log(z);
+}
+
+static double logaddexp(double a, double b) {
+    if (a == -INFINITY) return b;
+    if (b == -INFINITY) return a;
+    const double m = std::max(a, b);
+    return m + std::log(std::exp(a - m) + std::exp(b - m));
+}
+
+// Sum over the boundary flag of every byte of p(bytes[i..], flags), accumulated into total (log space).
+// lg predicts bytes[i] in the current state; prefix = log-probability of the path so far. Depth-first, the likelier
+// flag first; a branch is skipped when its prefix probability is below mass_eps of the mass found so far (it cannot
+// add more than its prefix), or when its flag has less than tau of its byte's probability. budget caps the steps.
+struct marg_ctx {
+    llama_bolmo * bolmo;
+    const std::vector<int32_t> * bytes;
+    int n_vocab;
+    int32_t boff;
+    double log_tau, log_mass_eps;
+    long steps = 0, budget = 0;
+    bool truncated = false;
+};
+
+static void bolmo_marginal(marg_ctx & m, size_t i, const std::vector<float> & lg, double prefix, double & total) {
+    const auto & bytes = *m.bytes;
+    double l[2];
+    logp_pair(lg.data(), m.n_vocab, bytes[i], m.boff, l[0], l[1]);
+    const double lb = logaddexp(l[0], l[1]);
+    if (i + 1 == bytes.size()) {
+        total = logaddexp(total, prefix + lb);
+        return;
+    }
+    const int order[2] = { l[1] > l[0] ? 1 : 0, l[1] > l[0] ? 0 : 1 };
+    llama_bolmo_snapshot * snap = nullptr;
+    std::vector<float> lg2(m.n_vocab);
+    bool stepped = false;
+    for (int k = 0; k < 2; ++k) {
+        const int f = order[k];
+        if (l[f] - lb < m.log_tau) {
+            continue;
+        }
+        if (total > -INFINITY && prefix + l[f] < total + m.log_mass_eps) {
+            continue;
+        }
+        if (m.steps >= m.budget) {
+            m.truncated = true;
+            continue;
+        }
+        if (stepped) {
+            llama_bolmo_snapshot_restore(m.bolmo, snap);
+        } else if (k == 0) {
+            snap = llama_bolmo_snapshot_take(m.bolmo); // needed if the second flag is explored too
+        }
+        if (llama_bolmo_step(m.bolmo, bytes[i] + f*m.boff, lg2.data()) != 0) {
+            fprintf(stderr, "step failed\n");
+            exit(1);
+        }
+        m.steps++;
+        stepped = true;
+        bolmo_marginal(m, i + 1, lg2, prefix + l[f], total);
+    }
+    if (snap) {
+        llama_bolmo_snapshot_free(snap);
+    }
+}
+
 int main(int argc, char ** argv) {
     std::string model_path, prompt, score_file, dump_path, mcq_in, mcq_out;
-    bool mcq_tf = false;
+    bool mcq_tf = false, mcq_exact = false, test_snapshot = false;
+    double mcq_tau = 1e-3;
     int n_predict = 128, ngl = 0, n_threads = 8, n_ctx = 4096, n_batch = 512, chunk = 2048;
     float temp = 0.0f;
     unsigned seed = 1;
@@ -87,6 +169,9 @@ int main(int argc, char ** argv) {
         else if (a == "--show-patches") { show_patches = true; }
         else if (a == "--mcq") { mcq_in = next(); mcq_out = next(); }
         else if (a == "--mcq-tf") { mcq_tf = true; }
+        else if (a == "--mcq-exact") { mcq_exact = true; }
+        else if (a == "--test-snapshot") { test_snapshot = true; }
+        else if (a == "--mcq-tau") { mcq_tau = std::stod(next()); }
         else { usage(argv[0]); return 1; }
     }
     if (model_path.empty()) {
@@ -135,7 +220,40 @@ int main(int argc, char ** argv) {
 
     int ret = 0;
 
-    if (!mcq_in.empty()) {
+    if (test_snapshot) {
+        // snapshot, run 8 bytes (each fused, so the global model steps too), restore, run them again: same logits
+        const auto ids = tokenize(prompt);
+        std::vector<float> lg(n_vocab), a(n_vocab), bb(n_vocab);
+        if (llama_bolmo_prefill(bolmo, ids.data(), (int32_t) ids.size(), lg.data()) < 0) {
+            return 1;
+        }
+        const int32_t seq[8] = { 'a', 'b', 'c', ' ', 'd', 'e', 'f', ' ' };
+        llama_bolmo_snapshot * snap = llama_bolmo_snapshot_take(bolmo);
+        const int n0 = llama_bolmo_n_patches(bolmo);
+        double maxd = 0;
+        std::vector<std::vector<float>> first;
+        for (int pass = 0; pass < 2; ++pass) {
+            if (pass == 1) {
+                llama_bolmo_snapshot_restore(bolmo, snap);
+            }
+            for (int k = 0; k < 8; ++k) {
+                int32_t id = 0;
+                const char ch = (char) seq[k];
+                llama_bolmo_tokenize(bolmo, &ch, 1, &id, 1, false);
+                llama_bolmo_step(bolmo, id + (k % 2 ? boff : 0), a.data());
+                if (pass == 0) {
+                    first.push_back(a);
+                } else {
+                    for (int i = 0; i < n_vocab; ++i) {
+                        maxd = std::max(maxd, (double) std::fabs(a[i] - first[k][i]));
+                    }
+                }
+            }
+        }
+        printf("patches %d -> %d; max |logit difference| after restore: %g\n", n0, llama_bolmo_n_patches(bolmo), maxd);
+        llama_bolmo_snapshot_free(snap);
+        GGML_UNUSED(bb);
+    } else if (!mcq_in.empty()) {
         std::ifstream in(mcq_in);
         FILE * out = fopen(mcq_out.c_str(), "w");
         fprintf(out, "item\toption\tn_tokens\tn_bytes\tlogprob\n");
@@ -144,6 +262,7 @@ int main(int argc, char ** argv) {
         int item = 0;
         std::vector<float> lg(n_vocab);
         const bool dbg = getenv("LLAMA_BOLMO_DEBUG") != nullptr;
+        long mcq_steps = 0, mcq_trunc = 0;
         const auto t0 = ggml_time_us();
         while (std::getline(in, line)) {
             std::vector<std::string> f;
@@ -176,6 +295,29 @@ int main(int argc, char ** argv) {
                             fprintf(stderr, "tf item %d opt %d byte '%c' nll %.4f bnd[t] %d\n", item, o, (char) llama_bolmo_id_to_byte(bolmo, ids[t + 1]), nb, bnd[t]);
                         }
                     }
+                } else if (mcq_exact) {
+                    // the stem's last byte is the first one whose boundary flag is summed over
+                    if (llama_bolmo_prefill_ext(bolmo, ids_stem.data(), (int32_t) ids_stem.size(), lg.data(), false) < 0) {
+                        fprintf(stderr, "prefill failed\n");
+                        return 1;
+                    }
+                    std::vector<int32_t> bytes = { ids_stem.back() };
+                    for (char ch : opt) {
+                        int32_t id = 0;
+                        llama_bolmo_tokenize(bolmo, &ch, 1, &id, 1, false);
+                        bytes.push_back(id);
+                    }
+                    double l0, l1;
+                    logp_pair(lg.data(), n_vocab, bytes[0], boff, l0, l1);
+                    marg_ctx mc;
+                    mc.bolmo = bolmo; mc.bytes = &bytes; mc.n_vocab = n_vocab; mc.boff = boff;
+                    mc.log_tau = std::log(mcq_tau); mc.log_mass_eps = std::log(1e-4); mc.budget = 64*(long) bytes.size();
+                    double total = -INFINITY;
+                    bolmo_marginal(mc, 0, lg, 0.0, total);
+                    mcq_steps += mc.steps;
+                    mcq_trunc += mc.truncated;
+                    // condition on the stem: p(option | stem) = p(last stem byte, option) / p(last stem byte)
+                    lp = total - logaddexp(l0, l1);
                 } else {
                     if (llama_bolmo_prefill(bolmo, ids_stem.data(), (int32_t) ids_stem.size(), lg.data()) < 0) {
                         fprintf(stderr, "prefill failed\n");
@@ -202,8 +344,12 @@ int main(int argc, char ** argv) {
             }
             item++;
             if (item % 20 == 0) {
-                fprintf(stderr, "\r%d items (%.1f s)", item, (ggml_time_us() - t0) / 1e6);
+                fprintf(stderr, "\r%d items (%.1f s, %ld branch steps, %ld options truncated)", item, (ggml_time_us() - t0) / 1e6, mcq_steps, mcq_trunc);
             }
+        }
+        fprintf(stderr, "\n%d items in %.1f s", item, (ggml_time_us() - t0) / 1e6);
+        if (mcq_exact) {
+            fprintf(stderr, ", %ld branch steps, %ld options truncated", mcq_steps, mcq_trunc);
         }
         fprintf(stderr, "\n");
         fclose(out);
