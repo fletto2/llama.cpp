@@ -2265,7 +2265,8 @@ static common_speculative_impl_ngram_cache create_state_ngram_cache(
         uint32_t n_seq,
         const std::string & path_static,
         const std::string & path_dynamic) {
-    uint16_t n_draft = 8; // TODO get from config?
+    // the same draft length as llama-lookup (--spec-draft-n-max); a fixed 8 drafted far past the matches
+    const uint16_t n_draft = config.params.draft.n_max > 0 ? config.params.draft.n_max : 3;
 
     // TODO bool param in common/common.h to set save_static/save_dynamic?
     bool save_static = false;
