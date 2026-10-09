@@ -2169,8 +2169,11 @@ struct common_speculative_impl_ngram_cache : public common_speculative_impl {
         }
     }
 
-    void begin(llama_seq_id /*seq_id*/, const llama_tokens & /*prompt*/) override {
-        // noop
+    void begin(llama_seq_id seq_id, const llama_tokens & /*prompt*/) override {
+        // the context cache belongs to one sequence: start it afresh for every new prompt
+        auto & sinfo = sinfos[seq_id];
+        sinfo.ngram_cache_context.clear();
+        sinfo.cache_size = 0;
     }
 
     void draft_one(
@@ -2181,28 +2184,21 @@ struct common_speculative_impl_ngram_cache : public common_speculative_impl {
 
         const auto & prompt = *dparams.prompt;
 
-        if (sinfo.cache_size < prompt.size() + 1) {
-            llama_tokens tokens_new;
-            tokens_new.reserve(prompt.size() + 1 - sinfo.cache_size);
-            for (size_t j = sinfo.cache_size; j < prompt.size(); ++j) {
-                tokens_new.push_back(prompt[j]);
-            }
-            tokens_new.push_back(dparams.id_last); // add the last token
-
-            // Update context ngram cache with new dparams.prompt:
-            common_ngram_cache_update(
-                    sinfo.ngram_cache_context,
-                    LLAMA_NGRAM_MIN, LLAMA_NGRAM_MAX,
-                    tokens_new, tokens_new.size(), false);
-            sinfo.cache_size = prompt.size() + 1;
-        }
-
         llama_tokens inp;
         inp.reserve(prompt.size() + 1);
         for (size_t j = 0; j < prompt.size(); ++j) {
             inp.push_back(prompt[j]);
         }
         inp.push_back(dparams.id_last);
+
+        if (sinfo.cache_size < inp.size()) {
+            // add the n-grams ending in the new tokens, including those that start in the old ones
+            common_ngram_cache_update(
+                    sinfo.ngram_cache_context,
+                    LLAMA_NGRAM_MIN, LLAMA_NGRAM_MAX,
+                    inp, inp.size() - sinfo.cache_size, false);
+            sinfo.cache_size = inp.size();
+        }
 
         result.push_back(dparams.id_last);
 
