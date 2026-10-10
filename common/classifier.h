@@ -92,6 +92,8 @@ struct common_classifier_capture {
     std::vector<std::vector<float>>  last; // per layer: the last row seen
     std::vector<std::vector<float>>  first; // per layer: the first row of the item (for mean1)
     std::vector<int64_t>             rows; // per layer
+    bool                             keep_rows = false; // also keep every row, for several items in one batch
+    std::vector<std::vector<float>>  all;  // per layer: every row in batch order (keep_rows only)
     std::vector<float>               buf;
     std::string                      error; // set by the callback; exceptions must not cross ggml
 
@@ -100,6 +102,8 @@ struct common_classifier_capture {
     int  index_of(int32_t layer) const;
     // pooled feature of one layer; false if the layer was not captured
     bool get(int32_t layer, common_classifier_pooling pooling, std::vector<float> & out) const;
+    // pooled feature of the rows [begin, end) of one layer (one item of a batch); needs keep_rows
+    bool get_range(int32_t layer, common_classifier_pooling pooling, int64_t begin, int64_t end, std::vector<float> & out) const;
 
     static bool cb_eval(struct ggml_tensor * t, bool ask, void * user_data);
 };

@@ -215,6 +215,7 @@ struct server_task {
 
     // used by SERVER_TASK_TYPE_CLASSIFY / FEATURES (the input) and SERVER_TASK_TYPE_LORA_TRAIN* (the request body)
     llama_tokens tokens_classify;
+    std::vector<llama_tokens> tokens_classify_batch; // SERVER_TASK_TYPE_CLASSIFY with several inputs
     json         lora_train;
 
     // used by SERVER_TASK_TYPE_FEATURES*: layers (1..n_layer; FEATURES_RAW: empty = the automatic

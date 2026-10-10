@@ -296,12 +296,14 @@ void common_classifier_capture::set_layers(int32_t n_embd, const std::vector<int
     last.assign(layers.size(), std::vector<float>(n_embd, 0.0f));
     first.assign(layers.size(), std::vector<float>(n_embd, 0.0f));
     rows.assign(layers.size(), 0);
+    all.assign(layers.size(), {});
     error.clear();
 }
 
 void common_classifier_capture::reset() {
     for (auto & s : sum) std::fill(s.begin(), s.end(), 0.0);
     std::fill(rows.begin(), rows.end(), 0);
+    for (auto & a : all) a.clear();
     error.clear();
 }
 
@@ -330,6 +332,32 @@ bool common_classifier_capture::get(int32_t layer, common_classifier_pooling poo
         } else {
             out[j] = (float) (sum[i][j] / (double) rows[i]);
         }
+    }
+    return true;
+}
+
+bool common_classifier_capture::get_range(int32_t layer, common_classifier_pooling pooling, int64_t begin, int64_t end,
+                                         std::vector<float> & out) const {
+    const int i = index_of(layer);
+    if (i < 0 || begin < 0 || end <= begin || (int64_t) all[i].size() < end * n_embd) {
+        return false;
+    }
+    out.assign(n_embd, 0.0f);
+    if (pooling == COMMON_CLASSIFIER_POOL_LAST) {
+        memcpy(out.data(), all[i].data() + (end - 1) * n_embd, n_embd * sizeof(float));
+        return true;
+    }
+    // mean1 falls back to the plain mean for a one-token item, as in get()
+    const int64_t b = (pooling == COMMON_CLASSIFIER_POOL_MEAN1 && end - begin > 1) ? begin + 1 : begin;
+    std::vector<double> s(n_embd, 0.0);
+    for (int64_t r = b; r < end; r++) {
+        const float * row = all[i].data() + r * n_embd;
+        for (int32_t j = 0; j < n_embd; j++) {
+            s[j] += row[j];
+        }
+    }
+    for (int32_t j = 0; j < n_embd; j++) {
+        out[j] = (float) (s[j] / (double) (end - b));
     }
     return true;
 }
@@ -378,6 +406,14 @@ bool common_classifier_capture::cb_eval(struct ggml_tensor * t, bool ask, void *
     }
     if (n_rows > 0) {
         memcpy(self->last[i].data(), self->buf.data() + (n_rows - 1) * n_embd, n_embd * sizeof(float));
+    }
+    if (self->keep_rows) {
+        try {
+            self->all[i].insert(self->all[i].end(), self->buf.begin(), self->buf.begin() + n_rows * n_embd);
+        } catch (const std::exception & e) {
+            self->error = std::string("classifier: ") + e.what();
+            return false;
+        }
     }
     self->rows[i] += n_rows;
     return true;

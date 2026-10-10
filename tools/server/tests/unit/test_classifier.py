@@ -101,6 +101,27 @@ def test_classify_batch_matches_single_and_generation(meta, tmp_path):
     assert noul(server.make_request("POST", "/classify", data={"input": texts[0]}), "q") == pytest.approx(single[0], abs=1e-6)
 
 
+def test_classify_batch_chunks_and_poolings(meta, tmp_path):
+    # 70 inputs: more than one batch of 64 sequences, and a small context forces more splits; every pooling
+    rng = np.random.default_rng(1)
+    heads = []
+    for pooling in ["mean", "mean1", "last"]:
+        heads += ["--classifier", write_head(str(tmp_path / f"{pooling}.gguf"), meta["n_embd"], 3,
+                                             rng.standard_normal(meta["n_embd"]) * 0.1, 0.0, pooling, pooling=pooling)]
+    server.extra_args = heads + ["--classifier-ctx", "64"]
+    server.start()
+    inputs = [[int(t) for t in rng.integers(1, meta["n_vocab"], size=int(n))] for n in rng.integers(1, 12, size=70)]
+    batch = server.make_request("POST", "/classify", data={"input": inputs})
+    assert batch.status_code == 200
+    assert len(batch.body) == 70
+    for ids, r in zip(inputs, batch.body):
+        assert r["usage"]["input_tokens"] == len(ids)
+    for k in [0, 1, 31, 63, 64, 69]:
+        single = server.make_request("POST", "/classify", data={"input": inputs[k]})
+        for pooling in ["mean", "mean1", "last"]:
+            assert batch.body[k]["answers"][pooling]["noul"] == pytest.approx(noul(single, pooling), abs=1e-6)
+
+
 def test_classify_input_errors(meta, tmp_path):
     head = write_head(str(tmp_path / "zero.gguf"), meta["n_embd"], 2, np.zeros(meta["n_embd"]), 0.0)
     server.extra_args = ["--classifier", head, "--classifier-ctx", "32"]

@@ -23,7 +23,8 @@ bool server_classifier::features_enabled() const {
 }
 
 static std::unique_ptr<server_classifier_ctx> make_ctx(llama_model * model, int32_t n_ctx, int32_t n_threads,
-                                                       int32_t n_embd, const std::vector<int32_t> & layers, int32_t exit) {
+                                                       int32_t n_embd, const std::vector<int32_t> & layers, int32_t exit,
+                                                       int32_t n_seq = 1) {
     auto c = std::make_unique<server_classifier_ctx>();
     c->cap.set_layers(n_embd, layers);
     llama_context_params cp = llama_context_default_params();
@@ -35,7 +36,9 @@ static std::unique_ptr<server_classifier_ctx> make_ctx(llama_model * model, int3
     cp.n_ctx             = n_ctx;
     cp.n_batch           = n_ctx;
     cp.n_ubatch          = n_ctx;
-    cp.n_seq_max         = 1;
+    // several items share one batch, one sequence each, in one unified KV cache of n_ctx cells
+    cp.n_seq_max         = n_seq;
+    cp.kv_unified        = true;
     cp.n_threads         = n_threads;
     cp.n_threads_batch   = n_threads;
     cp.cb_eval           = common_classifier_capture::cb_eval;
@@ -55,6 +58,9 @@ void server_classifier::init(llama_model * model, const std::vector<std::string>
     this->n_vocab  = llama_vocab_n_tokens(llama_model_get_vocab(model));
     this->n_layer_ = llama_model_n_layer(model);
     this->n_threads = n_threads;
+    // hybrid and recurrent memories split a batch by sequence and may interleave the items' rows
+    // (and a batch never holds more inputs than tokens; the context needs n_seq_max <= n_batch)
+    this->n_seq_batch = (llama_model_is_recurrent(model) || llama_model_is_hybrid(model)) ? 1 : std::min(SERVER_CLASSIFIER_MAX_SEQ, n_ctx);
 
     for (const auto & path : paths) {
         common_classifier_head head;
@@ -92,7 +98,7 @@ void server_classifier::init(llama_model * model, const std::vector<std::string>
         }
     }
     for (int32_t L : layers) {
-        ctxs.push_back(make_ctx(model, n_ctx, n_threads, n_embd, {L}, L));
+        ctxs.push_back(make_ctx(model, n_ctx, n_threads, n_embd, {L}, L, n_seq_batch));
     }
     if (features) {
         feat = make_ctx(model, n_ctx, n_threads, n_embd, {}, 0);
@@ -192,6 +198,72 @@ json server_classifier::classify(const llama_tokens & tokens) {
     return answers;
 }
 
+void server_classifier::decode_batch(server_classifier_ctx & c, const std::vector<llama_tokens> & items, int64_t n_total) {
+    c.cap.reset();
+    c.cap.keep_rows = true;
+    llama_memory_clear(llama_get_memory(c.ctx), true);
+    llama_batch batch = llama_batch_init((int32_t) n_total, 0, 1);
+    for (size_t s = 0; s < items.size(); s++) {
+        for (size_t i = 0; i < items[s].size(); i++) {
+            const int32_t n = batch.n_tokens++;
+            batch.token[n]     = items[s][i];
+            batch.pos[n]       = (llama_pos) i;
+            batch.n_seq_id[n]  = 1;
+            batch.seq_id[n][0] = (llama_seq_id) s;
+            batch.logits[n]    = 1;
+        }
+    }
+    const int32_t ret = llama_decode(c.ctx, batch);
+    llama_batch_free(batch);
+    c.cap.keep_rows = false;
+    if (!c.cap.error.empty()) {
+        throw std::runtime_error(c.cap.error);
+    }
+    if (ret != 0) {
+        throw std::runtime_error("classifier: decode failed");
+    }
+    llama_synchronize(c.ctx);
+    for (size_t i = 0; i < c.cap.layers.size(); i++) {
+        if (c.cap.rows[i] != n_total) {
+            throw std::runtime_error("classifier: read " + std::to_string(c.cap.rows[i]) + " rows of layer " +
+                                     std::to_string(c.cap.layers[i]) + " for " + std::to_string(n_total) + " tokens");
+        }
+    }
+}
+
+std::vector<json> server_classifier::classify_batch(const std::vector<llama_tokens> & items) {
+    int64_t n_total = 0;
+    for (const auto & tokens : items) {
+        check_tokens(tokens);
+        n_total += (int64_t) tokens.size();
+    }
+    std::vector<json> out;
+    if (items.size() == 1 || (int32_t) items.size() > n_seq_batch || n_total > n_ctx) {
+        for (const auto & tokens : items) {
+            out.push_back(classify(tokens));
+        }
+        return out;
+    }
+    out.assign(items.size(), json::object());
+    std::vector<float> x;
+    for (auto & c : ctxs) {
+        decode_batch(*c, items, n_total);
+        int64_t begin = 0;
+        for (size_t k = 0; k < items.size(); k++) {
+            const int64_t end = begin + (int64_t) items[k].size();
+            for (const auto & head : heads) {
+                if (head.layer != c->cap.layers[0]) {
+                    continue;
+                }
+                c->cap.get_range(head.layer, head.pooling, begin, end, x);
+                out[k][head.question_id] = server_classifier_answer(head, common_classifier_probs(head, x.data()));
+            }
+            begin = end;
+        }
+    }
+    return out;
+}
+
 std::vector<float> server_classifier::features_raw(const llama_tokens & tokens, const std::vector<int32_t> & layers,
                                                   const std::vector<common_classifier_pooling> & poolings) {
     if (!feat) {
@@ -239,7 +311,7 @@ void server_classifier::add_head(const common_classifier_head & head_in) {
         have_ctx = have_ctx || c->cap.layers[0] == head.layer;
     }
     if (!have_ctx) {
-        ctxs.push_back(make_ctx(model, n_ctx, n_threads, n_embd, {head.layer}, head.layer));
+        ctxs.push_back(make_ctx(model, n_ctx, n_threads, n_embd, {head.layer}, head.layer, n_seq_batch));
     }
     bool replaced = false;
     for (auto & h : heads) {

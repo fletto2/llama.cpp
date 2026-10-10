@@ -18,6 +18,9 @@
 
 struct server_classifier_ctx;
 
+// most inputs of one /classify request decoded together (one sequence each)
+#define SERVER_CLASSIFIER_MAX_SEQ 64
+
 struct server_classifier {
     server_classifier();
     ~server_classifier();
@@ -31,6 +34,10 @@ struct server_classifier {
 
     // typed-decision answers for one input: {"<question_id>": {"type": ..., ...}, ...}
     json classify(const llama_tokens & tokens);
+
+    // the answers for several inputs, decoded in one batch when they fit the context together (at most
+    // SERVER_CLASSIFIER_MAX_SEQ inputs, plain-attention models); otherwise one by one
+    std::vector<json> classify_batch(const std::vector<llama_tokens> & items);
 
     // pooled residuals: {"<layer>": {"mean": [...], "last": [...]}} for the requested layers and poolings
     json features(const llama_tokens & tokens, const std::vector<int32_t> & layers,
@@ -52,6 +59,7 @@ struct server_classifier {
 private:
     void check_tokens(const llama_tokens & tokens) const;
     void decode(server_classifier_ctx & c, const llama_tokens & tokens);
+    void decode_batch(server_classifier_ctx & c, const std::vector<llama_tokens> & items, int64_t n_total);
 
     llama_model * model    = nullptr;
     int32_t       n_embd   = 0;
@@ -59,6 +67,7 @@ private:
     int32_t       n_vocab  = 0;
     int32_t       n_layer_ = 0;
     int32_t       n_threads = 1;
+    int32_t       n_seq_batch = 1; // inputs per batch (1 for hybrid / recurrent models)
     std::vector<std::unique_ptr<server_classifier_ctx>> ctxs;
     std::unique_ptr<server_classifier_ctx>              feat; // --features
 };

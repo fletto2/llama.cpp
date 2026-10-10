@@ -131,6 +131,8 @@ Heads that read the same layer share one early-exit context on the loaded model.
 {"model": "...", "answers": {"relevant": {"type": "noul", "noul": 0.97}, "topic": {"type": "choice", ...}}, "usage": {"input_tokens": 35, "output_tokens": 0}}
 ```
 
+An array of inputs returns an array of these objects, in input order. The inputs are decoded together, one sequence each, in batches of up to 64 inputs whose tokens fit `--classifier-ctx` together; on Qwen3-8B (CPU) 24 short inputs take 1.7× less time than one request each. Hybrid and recurrent models (e.g. Qwen3.5) still decode the inputs one by one. Answers match the one-by-one ones up to the float noise of a different batch shape.
+
 **`POST /features`** (`--features`): pooled hidden states, for training heads elsewhere. The body: `input` as above, `layers` (a number or an array, 1..n_layer, default the last layer), `pooling` (`"mean"`, `"last"` or both, default both). The response: `{"model": ..., "n_tokens": 35, "features": {"18": {"mean": [...], "last": [...]}}}`. The context computes only up to the deepest requested layer.
 
 **`POST /classify/train`** (`--classifier-train`, which also turns on `--features`): fits a head on labelled inputs and adds it to `/classify` at once. A head with the same `question_id` is replaced. The body:
