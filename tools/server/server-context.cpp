@@ -6130,8 +6130,9 @@ void server_routes::init_routes() {
         std::vector<std::string> pool_names;
         if (pooling == "auto" || pooling == "mean") pool_names.push_back("mean");
         if (pooling == "auto" || pooling == "last") pool_names.push_back("last");
+        if (pooling == "auto" || pooling == "mean1") pool_names.push_back("mean1");
         if (pool_names.empty()) {
-            return bad("\"pooling\" must be auto, mean or last");
+            return bad("\"pooling\" must be auto, mean, last or mean1");
         }
         std::vector<common_classifier_pooling> pools;
         for (const auto & name : pool_names) {
@@ -6230,6 +6231,12 @@ void server_routes::init_routes() {
         head.n_embd  = d;
         head.weight  = tr.weight;
         head.bias    = tr.bias;
+        {
+            char ts[32];
+            const time_t now = time(nullptr);
+            strftime(ts, sizeof ts, "%Y%m%d-%H%M%S", gmtime(&now));
+            head.version = head.question_id + "-live-" + ts;
+        }
 
         json cv = {{"log_loss", tr.cv.log_loss}, {"accuracy", tr.cv.accuracy}};
         if (tr.cv.auc >= 0.0) cv["auc"] = tr.cv.auc;

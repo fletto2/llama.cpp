@@ -2,10 +2,10 @@
 // hidden states. The heads it writes are served by llama-server (--classifier head.gguf, POST /classify).
 //
 //   llama-classifier train    -m model.gguf --data train.jsonl --type noul|choice|score --out head.gguf
-//                             [--question-id ID] [--options a,b,c] [--layers auto|L,L,..] [--pooling auto|mean|last]
+//                             [--question-id ID] [--options a,b,c] [--layers auto|L,L,..] [--pooling auto|mean|last|mean1]
 //                             [--C 0.01,0.1,1] [--folds 5] [--balanced] [--seed N]
 //   llama-classifier eval     -m model.gguf --head head.gguf --data test.jsonl [--predictions out.jsonl]
-//   llama-classifier features -m model.gguf --data data.jsonl --layers L,L,..|all --out prefix [--pooling mean|last]
+//   llama-classifier features -m model.gguf --data data.jsonl --layers L,L,..|all --out prefix [--pooling mean|last|mean1]
 //   llama-classifier fit      --features prefix.L12.mean.f32 --labels prefix.labels.txt --layer 12 --type ... --out head.gguf
 //
 // Data (JSONL), one item per line: {"text": "...", "label": ...} or {"tokens": [ids], "label": ...}.
@@ -28,6 +28,8 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <ctime>
+#include <map>
 #include <cstring>
 #include <fstream>
 #include <map>
@@ -47,7 +49,7 @@ struct item {
 
 struct args_t {
     std::string cmd, model, data, out, head, type = "noul", question_id, options, layers = "auto", pooling = "auto",
-                Cs = "0.01,0.1,1", features, labels, predictions;
+                Cs = "0.01,0.1,1", features, labels, predictions, version, prompt_hash, grid_out, grids;
     int32_t ngl = 0, threads = 0, n_ctx = 512, folds = 5, layer = 0;
     uint32_t seed = 42;
     bool balanced = false;
@@ -72,11 +74,13 @@ static void usage() {
     fprintf(stderr,
         "usage:\n"
         "  llama-classifier train    -m model.gguf --data train.jsonl --type noul|choice|score --out head.gguf\n"
-        "                            [--question-id ID] [--options a,b,c] [--layers auto|L,L,..] [--pooling auto|mean|last]\n"
+        "                            [--question-id ID] [--options a,b,c] [--layers auto|L,L,..] [--pooling auto|mean|last|mean1]\n"
         "                            [--C 0.01,0.1,1] [--folds 5] [--balanced] [--seed N]\n"
         "  llama-classifier eval     -m model.gguf --head head.gguf --data test.jsonl [--predictions out.jsonl]\n"
-        "  llama-classifier features -m model.gguf --data data.jsonl --layers L,L,..|all --out prefix [--pooling mean|last]\n"
+        "  llama-classifier features -m model.gguf --data data.jsonl --layers L,L,..|all --out prefix [--pooling mean|last|mean1]\n"
         "  llama-classifier fit      --features x.f32 --labels labels.txt --layer L --type ... --out head.gguf\n"
+        "  llama-classifier pick-layer --grids a.tsv,b.tsv,..   (one layer for several heads; grids from train --grid-out)\n"
+        "  train also takes: --version ID (default <question>-<UTC time>-<data hash>), --prompt-hash STR, --grid-out FILE\n"
         "common: -ngl N (0), -t N (threads), -c N (max tokens per item, 512)\n"
         "data: JSONL lines {\"text\": ..., \"label\": ...} or {\"tokens\": [...], \"label\": ...}\n");
     exit(1);
@@ -109,6 +113,10 @@ static args_t parse(int argc, char ** argv) {
         else if (k == "--features")             a.features = v();
         else if (k == "--labels")               a.labels = v();
         else if (k == "--predictions")          a.predictions = v();
+        else if (k == "--version")              a.version = v();
+        else if (k == "--prompt-hash")          a.prompt_hash = v();
+        else if (k == "--grid-out")             a.grid_out = v();
+        else if (k == "--grids")                a.grids = v();
         else fatal("unknown option " + k);
     }
     if (a.threads <= 0) a.threads = std::max(1, (int) std::thread::hardware_concurrency());
@@ -284,7 +292,8 @@ static int cmd_train(const args_t & a) {
     std::vector<common_classifier_pooling> pools;
     if (a.pooling == "auto" || a.pooling == "mean") pools.push_back(COMMON_CLASSIFIER_POOL_MEAN);
     if (a.pooling == "auto" || a.pooling == "last") pools.push_back(COMMON_CLASSIFIER_POOL_LAST);
-    if (pools.empty()) fatal("--pooling must be auto, mean or last");
+    if (a.pooling == "auto" || a.pooling == "mean1") pools.push_back(COMMON_CLASSIFIER_POOL_MEAN1);
+    if (pools.empty()) fatal("--pooling must be auto, mean, last or mean1");
     std::vector<double> Cs;
     for (const auto & s : split(a.Cs, ',')) Cs.push_back(std::stod(s));
 
@@ -306,10 +315,37 @@ static int cmd_train(const args_t & a) {
     fprintf(stderr, "chosen: layer %d, %s pooling, C %g: %s\n", tr.layer, common_classifier_pooling_name(tr.pooling), bC,
             fmt_metrics(bm, type).c_str());
 
+    if (!a.grid_out.empty()) {                 // every setting, for `pick-layer` across several heads
+        std::ofstream g(a.grid_out);
+        if (!g) fatal("cannot write " + a.grid_out);
+        g << "layer\tpooling\tC\tlog_loss\n";
+        for (const auto & r : tr.grid) {
+            g << r.layer << "\t" << common_classifier_pooling_name(r.pooling) << "\t" << r.C << "\t" << r.log_loss << "\n";
+        }
+    }
+
     common_classifier_head h;
     h.question_id = a.question_id.empty() ? "relevant" : a.question_id;
     h.type = type; h.pooling = tr.pooling; h.layer = tr.layer; h.n_embd = d;
     h.options = options; h.weight = tr.weight; h.bias = tr.bias;
+    h.model = common_classifier_model_desc(ex.model);
+    // data fingerprint: FNV-1a over the training file, so two fits on different data get different versions
+    uint64_t fnv = 1469598103934665603ull;
+    {
+        std::ifstream df(a.data, std::ios::binary);
+        char c;
+        while (df.get(c)) { fnv ^= (unsigned char) c; fnv *= 1099511628211ull; }
+    }
+    char fnvb[20];
+    snprintf(fnvb, sizeof fnvb, "%016llx", (unsigned long long) fnv);
+    if (!a.version.empty()) {
+        h.version = a.version;
+    } else {
+        char ts[32];
+        const time_t now = time(nullptr);
+        strftime(ts, sizeof ts, "%Y%m%d-%H%M%S", gmtime(&now));
+        h.version = h.question_id + "-" + ts + "-" + std::string(fnvb).substr(0, 8);
+    }
     char cvb[64];
     std::vector<std::pair<std::string, std::string>> info = {
         {"model",      a.model.substr(a.model.find_last_of('/') + 1)},
@@ -318,7 +354,9 @@ static int cmd_train(const args_t & a) {
         {"balanced",   a.balanced ? "true" : "false"},
         {"folds",      std::to_string(a.folds)},
         {"cv",         fmt_metrics(bm, type)},
+        {"data_fnv1a", fnvb},
     };
+    if (!a.prompt_hash.empty()) info.push_back({"prompt_hash", a.prompt_hash});
     snprintf(cvb, sizeof cvb, "%.6f", bm.log_loss); info.push_back({"cv_log_loss", cvb});
     if (!common_classifier_head_save(a.out, h, err, info)) fatal(err);
     fprintf(stderr, "head -> %s (layer %d, %s, %s, %d iterations)\n", a.out.c_str(), h.layer,
@@ -336,6 +374,10 @@ static int cmd_eval(const args_t & a) {
     const std::vector<int32_t> y = encode_labels(items, h.type, options);
     extractor ex(a, {h.layer});
     if (ex.cap.n_embd != h.n_embd) fatal("the head is for n_embd " + std::to_string(h.n_embd) + ", the model has " + std::to_string(ex.cap.n_embd));
+    if (!h.model.empty() && h.model != common_classifier_model_desc(ex.model)) {
+        fprintf(stderr, "warning: the head was fitted on '%s', this model is '%s'\n", h.model.c_str(),
+                common_classifier_model_desc(ex.model).c_str());
+    }
     const int32_t K = h.n_classes();
     std::vector<double> probs;
     std::ofstream pred;
@@ -360,6 +402,7 @@ static int cmd_features(const args_t & a) {
     std::vector<common_classifier_pooling> pools;
     if (a.pooling == "auto" || a.pooling == "mean") pools.push_back(COMMON_CLASSIFIER_POOL_MEAN);
     if (a.pooling == "auto" || a.pooling == "last") pools.push_back(COMMON_CLASSIFIER_POOL_LAST);
+    if (a.pooling == "auto" || a.pooling == "mean1") pools.push_back(COMMON_CLASSIFIER_POOL_MEAN1);
     extractor ex(a, layers);
     const auto feats = extract(ex, items, pools);
     for (size_t l = 0; l < layers.size(); l++) {
@@ -410,11 +453,62 @@ static int cmd_fit(const args_t & a) {
     h.question_id = a.question_id.empty() ? "relevant" : a.question_id;
     h.type = type; h.layer = a.layer; h.n_embd = d; h.options = options; h.weight = fit.weight; h.bias = fit.bias;
     common_classifier_pooling pool = COMMON_CLASSIFIER_POOL_MEAN;
-    if (a.pooling != "auto" && !common_classifier_pooling_from_name(a.pooling, pool)) fatal("--pooling must be mean or last");
+    if (a.pooling != "auto" && !common_classifier_pooling_from_name(a.pooling, pool)) fatal("--pooling must be mean, last or mean1");
     h.pooling = pool;
     std::string err;
     if (!common_classifier_head_save(a.out, h, err, {{"cv", fmt_metrics(m, type)}, {"C", std::to_string(fp.C)}})) fatal(err);
     fprintf(stderr, "head -> %s\n", a.out.c_str());
+    return 0;
+}
+
+// pick-layer --grids a.tsv,b.tsv,..: one layer for several heads. Each grid is a `train --grid-out` file (one
+// question each). Per grid, the best held-out log-loss at each layer (over pooling and C); the chosen layer minimises
+// the sum over grids, so the heads can share one early-exit context. Retrain each head with --layers <chosen>.
+static int cmd_pick_layer(const args_t & a) {
+    const auto files = split(a.grids, ',');
+    if (files.empty()) usage();
+    std::vector<std::map<int32_t, double>> best(files.size());
+    for (size_t f = 0; f < files.size(); f++) {
+        std::ifstream in(files[f]);
+        if (!in) fatal("cannot read " + files[f]);
+        std::string line;
+        std::getline(in, line);   // header
+        while (std::getline(in, line)) {
+            const auto c = split(line, '\t');
+            if (c.size() < 4) continue;
+            const int32_t L = std::stoi(c[0]);
+            const double  v = std::stod(c[3]);
+            auto it = best[f].find(L);
+            if (it == best[f].end() || v < it->second) best[f][L] = v;
+        }
+    }
+    int32_t chosen = -1;
+    double  chosen_sum = INFINITY;
+    printf("layer");
+    for (const auto & fn : files) printf("\t%s", fn.substr(fn.find_last_of('/') + 1).c_str());
+    printf("\tsum\n");
+    for (const auto & kv : best[0]) {
+        const int32_t L = kv.first;
+        double sum = 0.0;
+        bool all = true;
+        for (const auto & b : best) {
+            auto it = b.find(L);
+            if (it == b.end()) { all = false; break; }
+            sum += it->second;
+        }
+        if (!all) continue;
+        printf("%d", L);
+        for (const auto & b : best) printf("\t%.4f", b.at(L));
+        printf("\t%.4f\n", sum);
+        if (sum < chosen_sum) { chosen_sum = sum; chosen = L; }
+    }
+    if (chosen < 0) fatal("no layer appears in every grid");
+    for (size_t f = 0; f < files.size(); f++) {
+        auto own = std::min_element(best[f].begin(), best[f].end(), [](const auto & x, const auto & y) { return x.second < y.second; });
+        fprintf(stderr, "%s: own best layer %d (%.4f), at the shared layer %.4f\n", files[f].c_str(), own->first, own->second,
+                best[f].at(chosen));
+    }
+    printf("chosen layer %d\n", chosen);
     return 0;
 }
 
@@ -429,6 +523,7 @@ int main(int argc, char ** argv) {
     else if (a.cmd == "eval")     ret = cmd_eval(a);
     else if (a.cmd == "features") ret = cmd_features(a);
     else if (a.cmd == "fit")      ret = cmd_fit(a);
+    else if (a.cmd == "pick-layer") ret = cmd_pick_layer(a);
     else usage();
     llama_backend_free();
     return ret;

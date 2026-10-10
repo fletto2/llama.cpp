@@ -2,6 +2,7 @@
 
 #include "ggml-backend.h"
 #include "gguf.h"
+#include "llama.h"
 
 #include <algorithm>
 #include <cmath>
@@ -30,16 +31,28 @@ bool common_classifier_type_from_name(const std::string & name, common_classifie
 }
 
 const char * common_classifier_pooling_name(common_classifier_pooling pooling) {
-    return pooling == COMMON_CLASSIFIER_POOL_LAST ? "last" : "mean";
+    switch (pooling) {
+        case COMMON_CLASSIFIER_POOL_LAST:  return "last";
+        case COMMON_CLASSIFIER_POOL_MEAN1: return "mean1";
+        default:                           return "mean";
+    }
 }
 
 bool common_classifier_pooling_from_name(const std::string & name, common_classifier_pooling & pooling) {
     if (name == "mean") { pooling = COMMON_CLASSIFIER_POOL_MEAN; return true; }
     if (name == "last") { pooling = COMMON_CLASSIFIER_POOL_LAST; return true; }
+    if (name == "mean1") { pooling = COMMON_CLASSIFIER_POOL_MEAN1; return true; }
     return false;
 }
 
 // ---- head ------------------------------------------------------------------------------------------
+
+std::string common_classifier_model_desc(const llama_model * model) {
+    char desc[256];
+    llama_model_desc(model, desc, sizeof desc);
+    return std::string(desc) + " | " + std::to_string(llama_model_n_params(model)) + " params | " +
+           std::to_string(llama_model_size(model)) + " bytes";
+}
 
 int32_t common_classifier_head::n_classes() const {
     return type == COMMON_CLASSIFIER_NOUL ? 2 : (int32_t) options.size();
@@ -132,13 +145,15 @@ bool common_classifier_head_load(const std::string & path, common_classifier_hea
         fail("classifier.layer is not a 32-bit integer");
     }
     head.question_id = get_str("classifier.question_id", "relevant");
+    head.version     = get_str("classifier.version", "");
+    head.model       = get_str("classifier.model", "");
     const std::string type = get_str("classifier.type", "noul");
     if (!common_classifier_type_from_name(type, head.type)) {
         fail("unsupported classifier.type '" + type + "' (noul, choice, score)");
     }
     const std::string pooling = get_str("classifier.pooling", "mean");
     if (!common_classifier_pooling_from_name(pooling, head.pooling)) {
-        fail("unsupported classifier.pooling '" + pooling + "' (mean, last)");
+        fail("unsupported classifier.pooling '" + pooling + "' (mean, last, mean1)");
     }
     const int64_t id_opt = gguf_find_key(ctx, "classifier.options");
     if (id_opt >= 0) {
@@ -186,6 +201,8 @@ bool common_classifier_head_save(const std::string & path, const common_classifi
     gguf_set_val_str(ctx, "classifier.question_id", head.question_id.c_str());
     gguf_set_val_str(ctx, "classifier.type", common_classifier_type_name(head.type));
     gguf_set_val_str(ctx, "classifier.pooling", common_classifier_pooling_name(head.pooling));
+    if (!head.version.empty()) gguf_set_val_str(ctx, "classifier.version", head.version.c_str());
+    if (!head.model.empty())   gguf_set_val_str(ctx, "classifier.model",   head.model.c_str());
     if (!head.options.empty()) {
         std::vector<const char *> opts;
         for (const auto & o : head.options) {
@@ -277,6 +294,7 @@ void common_classifier_capture::set_layers(int32_t n_embd, const std::vector<int
     this->layers = layers;
     sum.assign(layers.size(), std::vector<double>(n_embd, 0.0));
     last.assign(layers.size(), std::vector<float>(n_embd, 0.0f));
+    first.assign(layers.size(), std::vector<float>(n_embd, 0.0f));
     rows.assign(layers.size(), 0);
     error.clear();
 }
@@ -302,8 +320,16 @@ bool common_classifier_capture::get(int32_t layer, common_classifier_pooling poo
         return false;
     }
     out.resize(n_embd);
+    // mean1 falls back to the plain mean for a one-token input
+    const bool skip_first = pooling == COMMON_CLASSIFIER_POOL_MEAN1 && rows[i] > 1;
     for (int32_t j = 0; j < n_embd; j++) {
-        out[j] = pooling == COMMON_CLASSIFIER_POOL_LAST ? last[i][j] : (float) (sum[i][j] / (double) rows[i]);
+        if (pooling == COMMON_CLASSIFIER_POOL_LAST) {
+            out[j] = last[i][j];
+        } else if (skip_first) {
+            out[j] = (float) ((sum[i][j] - first[i][j]) / (double) (rows[i] - 1));
+        } else {
+            out[j] = (float) (sum[i][j] / (double) rows[i]);
+        }
     }
     return true;
 }
@@ -340,6 +366,9 @@ bool common_classifier_capture::cb_eval(struct ggml_tensor * t, bool ask, void *
         return false;
     }
     ggml_backend_tensor_get(t, self->buf.data(), 0, ggml_nbytes(t));
+    if (self->rows[i] == 0 && n_rows > 0) {   // first ubatch of the item: keep its first row (position 0)
+        memcpy(self->first[i].data(), self->buf.data(), n_embd * sizeof(float));
+    }
     double * s = self->sum[i].data();
     for (int64_t r = 0; r < n_rows; r++) {
         const float * row = self->buf.data() + r * n_embd;
@@ -793,6 +822,7 @@ bool common_classifier_train(const std::vector<std::vector<std::vector<float>>> 
     double best = INFINITY;
     size_t bl = 0, bp = 0;
     res.log.clear();
+    res.grid.clear();
     for (size_t l = 0; l < layers.size(); l++) {
         for (size_t p = 0; p < pools.size(); p++) {
             for (double C : params.Cs) {
@@ -801,6 +831,7 @@ bool common_classifier_train(const std::vector<std::vector<std::vector<float>>> 
                 char b[96];
                 snprintf(b, sizeof b, "layer %3d  %-4s  C %-6g  ", layers[l], common_classifier_pooling_name(pools[p]), C);
                 res.log.push_back(b + common_classifier_metrics_str(m, fp.type));
+                res.grid.push_back({layers[l], pools[p], C, m.log_loss});
                 if (m.log_loss < best) { best = m.log_loss; bl = l; bp = p; res.C = C; res.cv = m; }
             }
         }

@@ -169,6 +169,7 @@ def test_classify_score_constant(meta, tmp_path):
     assert a["type"] == "score"
     assert a["score"] == pytest.approx(float((np.arange(4) * p).sum()), abs=1e-6)
     assert a["confidence"] == pytest.approx(p.max(), abs=1e-6)
+    assert a["level"] == int(np.argmax(p)) and a["label"] == legend[int(np.argmax(p))]
     for k in range(4):
         assert a["probabilities"][str(k)] == pytest.approx(p[k], abs=1e-6)
         assert a["legend"][str(k)] == legend[k]
@@ -252,7 +253,7 @@ def test_classify_train_choice_and_score(meta, tmp_path):
     r = res.body
     assert r["question_id"] == "animal" and r["type"] == "choice" and r["layer"] in (2, 4)
     assert r["options"] == ["bird", "cat", "dog"]
-    assert len(r["grid"]) == 2 * 2 * 2
+    assert len(r["grid"]) == 2 * 3 * 2   # layers x poolings (mean, last, mean1) x C
     assert r["cv"]["accuracy"] > 0.8
     assert os.path.exists(r["saved"])
     right = 0
@@ -272,6 +273,7 @@ def test_classify_train_choice_and_score(meta, tmp_path):
     assert set(a.keys()) == {"animal", "level"}
     assert a["level"]["legend"] == {"0": "cat", "1": "dog", "2": "bird"}
     assert a["level"]["score"] < 0.8  # data[0] is a cat (level 0)
+    assert a["level"]["level"] in (0, 1, 2) and a["level"]["version"].startswith("level-live-")
 
     # retraining replaces the head
     body = {"question_id": "animal", "type": "noul", "data": [{"input": d["input"], "label": d["label"] == "cat"} for d in data],

@@ -23,6 +23,8 @@
 
 #include "ggml.h"
 
+struct llama_model;
+
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -36,6 +38,7 @@ enum common_classifier_type {
 enum common_classifier_pooling {
     COMMON_CLASSIFIER_POOL_MEAN,
     COMMON_CLASSIFIER_POOL_LAST,
+    COMMON_CLASSIFIER_POOL_MEAN1, // mean without the first token (the attention-sink position)
 };
 
 const char * common_classifier_type_name(common_classifier_type type);
@@ -53,6 +56,8 @@ struct common_classifier_head {
     std::vector<std::string>  options;    // choice: option ids; score: level descriptions
     std::vector<float>        weight;     // n_out x n_embd, row-major
     std::vector<float>        bias;       // noul 1, choice K, score K-1
+    std::string               version;    // classifier.version: an id for this fit (training run, data), returned with answers
+    std::string               model;      // classifier.model: the model the head was fitted on (common_classifier_model_desc)
 
     int32_t n_classes() const; // noul 2 (index 1 = true), choice / score K
     int32_t n_out()     const; // rows of weight: choice K, else 1
@@ -66,6 +71,10 @@ struct common_classifier_head {
 bool common_classifier_head_load(const std::string & path, common_classifier_head & head, std::string & err);
 bool common_classifier_head_save(const std::string & path, const common_classifier_head & head, std::string & err,
                                  const std::vector<std::pair<std::string, std::string>> & extra = {});
+
+// "<description> | <n_params> params | <size> bytes" of a loaded model, stored in a head as classifier.model so a
+// head used with another model or quantization is detected (the head stays usable; callers warn)
+std::string common_classifier_model_desc(const llama_model * model);
 
 // class probabilities for one pooled feature vector of n_embd floats:
 // noul -> {p(false), p(true)}, choice / score -> K values
@@ -81,6 +90,7 @@ struct common_classifier_capture {
 
     std::vector<std::vector<double>> sum;  // per layer
     std::vector<std::vector<float>>  last; // per layer: the last row seen
+    std::vector<std::vector<float>>  first; // per layer: the first row of the item (for mean1)
     std::vector<int64_t>             rows; // per layer
     std::vector<float>               buf;
     std::string                      error; // set by the callback; exceptions must not cross ggml
@@ -168,6 +178,13 @@ struct common_classifier_train_result {
     std::vector<float>        bias;
     int32_t                   iters   = 0;
     std::vector<std::string>  log;     // one line per cross-validated setting
+    struct grid_row {
+        int32_t                   layer;
+        common_classifier_pooling pooling;
+        double                    C;
+        double                    log_loss;
+    };
+    std::vector<grid_row>     grid;    // every cross-validated setting (for a layer shared by several heads)
 };
 
 // feats[l][p]: n x d features of layers[l] with pools[p]. Every layer x pooling x C setting is

@@ -39,25 +39,27 @@ The middle layers usually make the best classifier features. Pick `L` by cross-v
 
 ## Classifier heads
 
-A head reads the residual after `L` layers, pooled over the input (`mean`, or the `last` token), and answers one question:
+A head reads the residual after `L` layers, pooled over the input (`mean`; `mean1`, the mean without the first token, whose attention-sink activation is large and content-independent; or the `last` token), and answers one question:
 
 | type | model | answer |
 |---|---|---|
 | `noul` | logistic regression, `p = sigmoid(w·x + b)` | `{"type": "noul", "noul": 0.97}` |
 | `choice` | softmax over K options, `softmax(W x + b)` | `{"type": "choice", "choice": "b", "confidence": 0.8, "probabilities": {"a": 0.1, "b": 0.8, "c": 0.1}}` |
-| `score` | proportional odds over K ordered levels, `P(y ≤ k) = sigmoid(θ_k − w·x)` | `{"type": "score", "score": 2.4, "confidence": 0.6, "legend": {"0": "none", ...}, "probabilities": {"0": 0.02, ...}}` |
+| `score` | proportional odds over K ordered levels, `P(y ≤ k) = sigmoid(θ_k − w·x)` | `{"type": "score", "score": 2.4, "level": 2, "label": "high", "confidence": 0.6, "legend": {"0": "none", ...}, "probabilities": {"0": 0.02, ...}}` |
 
-`score` is the expected level, `Σ k·p_k`. `confidence` is the probability of the most likely option or level.
+`score` is the expected level, `Σ k·p_k` (a float); `level` is the most likely level (an integer) and `label` its description, for callers that need a whole level. `confidence` is the probability of the most likely option or level. Every answer also carries the head's `version` when the head file has one.
 
 **Head file** (GGUF, `general.type = classifier`):
 - `classifier.layer` (u32): L
 - `classifier.question_id` (str)
 - `classifier.type`: `noul` | `choice` | `score` (default `noul`)
-- `classifier.pooling`: `mean` | `last` (default `mean`)
+- `classifier.pooling`: `mean` | `mean1` | `last` (default `mean`)
 - `classifier.options` ([str]): the option ids (`choice`) or level descriptions (`score`)
 - `classifier.weight` F32 [n_embd, n_out] (n_out = K for `choice`, else 1)
 - `classifier.bias` F32: [1] (`noul`), [K] (`choice`) or the K−1 non-decreasing thresholds θ (`score`)
-- `classifier.info.*` (str): training settings and cross-validated metrics, written by the trainers
+- `classifier.version` (str, optional): an id for this fit, returned with every answer (default from `llama-classifier train`: `<question>-<UTC time>-<data hash>`; live training: `<question>-live-<UTC time>`)
+- `classifier.model` (str, optional): the model the head was fitted on (description, parameter count, file size); llama-server and `llama-classifier eval` warn when a head is used with a different model or quantization
+- `classifier.info.*` (str): training settings and cross-validated metrics, written by the trainers (`train` also writes `data_fnv1a`, the hash of the training file, and `prompt_hash` when given)
 
 **Training** minimises the mean log-loss plus `‖w‖² / (2·C·n)`, on standardised features, with L-BFGS. That is the same objective as scikit-learn's `LogisticRegression(C)`; the stored weights are for raw features. On a 579-item, 4096-dimensional set it matches scikit-learn's probabilities within 2e-4, for `noul` and for `choice` (multinomial). `--balanced` weights the classes by inverse frequency.
 
@@ -65,13 +67,16 @@ A head reads the residual after `L` layers, pooled over the input (`mean`, or th
 # data: one JSON object per line, {"text": "...", "label": ...} or {"tokens": [...], "label": ...}
 # labels: true/false (noul), an option id (choice), a level name or index 0..K-1 (score)
 llama-classifier train -m model.gguf --data train.jsonl --type choice --question-id topic --out topic.gguf \
-    [--options a,b,c] [--layers auto|L,L,..] [--pooling auto|mean|last] [--C 0.01,0.1,1] [--folds 5] [--balanced]
+    [--options a,b,c] [--layers auto|L,L,..] [--pooling auto|mean|last|mean1] [--C 0.01,0.1,1] [--folds 5] [--balanced] \
+    [--version ID] [--prompt-hash STR] [--grid-out grid.tsv]
 llama-classifier eval     -m model.gguf --head topic.gguf --data test.jsonl [--predictions out.jsonl]
 llama-classifier features -m model.gguf --data data.jsonl --layers 12,18 --out feats    # raw f32 matrices + labels
 llama-classifier fit      --features feats.L18.mean.f32 --labels feats.labels.txt --layer 18 --type noul --out head.gguf
 ```
 
-`train` extracts the features of every candidate layer and both poolings in one pass. It cross-validates every layer × pooling × C setting (stratified k-fold), picks the one with the lowest held-out log-loss, and refits it on all items. `--layers auto` tries about 12 layers spread over the depth.
+`train` extracts the features of every candidate layer and all three poolings in one pass. It cross-validates every layer × pooling × C setting (stratified k-fold), picks the one with the lowest held-out log-loss, and refits it on all items. `--layers auto` tries about 12 layers spread over the depth.
+
+**One layer for several heads.** Heads that read the same layer share one early-exit context in llama-server; heads on different layers each need their own (KV and compute buffers). To keep several heads on one layer, train each with `--grid-out`, then `llama-classifier pick-layer --grids a.tsv,b.tsv,..` prints, per layer, each head's best held-out log-loss and their sum, and picks the layer with the lowest sum; retrain each head with `--layers <that layer>`.
 
 ## LoRA training
 

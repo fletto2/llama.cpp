@@ -75,6 +75,13 @@ void server_classifier::init(llama_model * model, const std::vector<std::string>
                 throw std::runtime_error("classifier: " + path + ": question_id '" + head.question_id + "' is already used by " + other.path);
             }
         }
+        if (!head.model.empty()) {
+            const std::string here = common_classifier_model_desc(model);
+            if (head.model != here) {
+                fprintf(stderr, "classifier: warning: %s was fitted on '%s', this model is '%s'; its answers may be off\n",
+                        path.c_str(), head.model.c_str(), here.c_str());
+            }
+        }
         heads.push_back(std::move(head));
     }
 
@@ -127,7 +134,17 @@ void server_classifier::decode(server_classifier_ctx & c, const llama_tokens & t
     }
 }
 
+static json server_classifier_answer_body(const common_classifier_head & head, const std::vector<double> & p);
+
 json server_classifier_answer(const common_classifier_head & head, const std::vector<double> & p) {
+    json j = server_classifier_answer_body(head, p);
+    if (!head.version.empty()) {
+        j["version"] = head.version;   // which fit produced the answer (cache keys, stale-head detection)
+    }
+    return j;
+}
+
+static json server_classifier_answer_body(const common_classifier_head & head, const std::vector<double> & p) {
     switch (head.type) {
         case COMMON_CLASSIFIER_NOUL:
             return json {{"type", "noul"}, {"noul", p[1]}};
@@ -148,8 +165,11 @@ json server_classifier_answer(const common_classifier_head & head, const std::ve
                 probs[std::to_string(k)]  = p[k];
                 legend[std::to_string(k)] = head.options[k];
             }
-            return json {{"type", "score"}, {"score", expected}, {"confidence", *std::max_element(p.begin(), p.end())},
-                         {"legend", legend}, {"probabilities", probs}};
+            // "score" is the expected level (a float); "level" is the most likely level (an integer) and "label"
+            // its description, for callers that need a whole level
+            const size_t best = std::max_element(p.begin(), p.end()) - p.begin();
+            return json {{"type", "score"}, {"score", expected}, {"level", (int) best}, {"label", head.options[best]},
+                         {"confidence", p[best]}, {"legend", legend}, {"probabilities", probs}};
         }
     }
     return json();
@@ -202,7 +222,11 @@ std::vector<float> server_classifier::features_raw(const llama_tokens & tokens, 
     return out;
 }
 
-void server_classifier::add_head(const common_classifier_head & head) {
+void server_classifier::add_head(const common_classifier_head & head_in) {
+    common_classifier_head head = head_in;
+    if (head.model.empty() && model) {
+        head.model = common_classifier_model_desc(model);   // live-trained heads: the model they were fitted on
+    }
     const std::string err = head.validate();
     if (!err.empty()) {
         throw std::invalid_argument("classifier: " + err);
@@ -259,6 +283,8 @@ json server_classifier::info() const {
             {"pooling",     common_classifier_pooling_name(head.pooling)},
             {"layer",       head.layer},
         };
+        if (!head.version.empty()) h["version"] = head.version;
+        if (!head.model.empty())   h["model"]   = head.model;
         if (!head.options.empty()) {
             h["options"] = head.options;
         }
